@@ -20,10 +20,13 @@ use_llm = st.checkbox("使用 DeepSeek 校验字段名", value=True)
 if selected and st.button("抽取参数", type="primary"):
     document_id = options[selected]
     with st.spinner("正在抽取参数..."):
-        parameters = get_parameter_extractor().extract_for_document(
+        extractor = get_parameter_extractor()
+        parameters = extractor.extract_for_document(
             document_id,
             use_llm=use_llm,
         )
+    if extractor.last_warning:
+        st.warning(extractor.last_warning)
     rows = [
         {
             "字段": item.normalized_name,
@@ -41,4 +44,3 @@ if selected and st.button("抽取参数", type="primary"):
 
 if not documents:
     st.info("尚未导入文档。")
-

@@ -12,6 +12,7 @@ from typing import Any
 from sqlalchemy import delete, select
 
 from sensor_vector_db.config.settings import Settings, get_settings
+from sensor_vector_db.core.import_jobs import classify_error
 from sensor_vector_db.core.llm_client import DeepseekChatClient
 from sensor_vector_db.models.database import (
     Document,
@@ -72,9 +73,11 @@ class ParameterExtractor:
         """Initialize extractor."""
         self.settings = settings or get_settings()
         self.llm_client = DeepseekChatClient(self.settings)
+        self.last_warning: str | None = None
 
     def extract_for_document(self, document_id: str, use_llm: bool = True) -> list[ParameterValue]:
         """Extract and persist parameters for one document."""
+        self.last_warning = None
         with session_scope(self.settings) as session:
             document = session.get(Document, document_id)
             if not document:
@@ -245,7 +248,8 @@ class ParameterExtractor:
             response = self.llm_client.chat(messages)
             decoded = json.loads(_extract_json(str(response)))
         except Exception as exc:
-            logger.warning("LLM parameter validation skipped: %s", exc)
+            self.last_warning = classify_error(exc, "DeepSeek 参数校验")
+            logger.warning("LLM parameter validation skipped: %s", self.last_warning)
             return parameters
         valid_keys = {
             (item.name, item.value, item.page_number): item
@@ -377,4 +381,3 @@ def _extract_json(text: str) -> str:
     """Extract the first JSON array/object substring from text."""
     match = re.search(r"(\[.*\]|\{.*\})", text, flags=re.DOTALL)
     return match.group(1) if match else text
-
