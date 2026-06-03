@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from sensor_vector_db.config.settings import get_settings  # noqa: E402
 from sensor_vector_db.core.document_manager import DocumentManager  # noqa: E402
+from sensor_vector_db.core.import_jobs import ImportJobManager  # noqa: E402
 from sensor_vector_db.core.parameter_extractor import (  # noqa: E402
     ParameterComparer,
     ParameterExtractor,
@@ -48,6 +49,12 @@ def get_document_manager() -> DocumentManager:
 
 
 @st.cache_resource(show_spinner=False)
+def get_import_job_manager() -> ImportJobManager:
+    """Return cached import job manager."""
+    return ImportJobManager(get_settings())
+
+
+@st.cache_resource(show_spinner=False)
 def get_search_engine() -> SearchEngine:
     """Return cached search engine."""
     return SearchEngine(get_settings())
@@ -74,8 +81,8 @@ def get_parameter_comparer() -> ParameterComparer:
 def clear_resource_caches() -> None:
     """Clear cached resources after settings changes."""
     get_document_manager.clear()
+    get_import_job_manager.clear()
     get_search_engine.clear()
     get_qa_system.clear()
     get_parameter_extractor.clear()
     get_parameter_comparer.clear()
-

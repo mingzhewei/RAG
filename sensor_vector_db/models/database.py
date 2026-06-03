@@ -13,6 +13,8 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    inspect,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
 from sqlalchemy.orm import sessionmaker
@@ -121,6 +123,88 @@ class QueryHistory(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class ImportJob(Base):
+    """Persistent background document import job."""
+
+    __tablename__ = "import_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    source_path: Mapped[str] = mapped_column(String(2048))
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    phase: Mapped[str] = mapped_column(String(128), default="等待开始")
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    current_file: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    total_files: Mapped[int] = mapped_column(Integer, default=0)
+    current_index: Mapped[int] = mapped_column(Integer, default=0)
+    imported: Mapped[int] = mapped_column(Integer, default=0)
+    updated: Mapped[int] = mapped_column(Integer, default=0)
+    skipped: Mapped[int] = mapped_column(Integer, default=0)
+    deleted: Mapped[int] = mapped_column(Integer, default=0)
+    failed: Mapped[int] = mapped_column(Integer, default=0)
+    report_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    events: Mapped[list["ImportJobEvent"]] = relationship(
+        back_populates="job",
+        cascade="all, delete-orphan",
+    )
+    files: Mapped[list["ImportJobFile"]] = relationship(
+        back_populates="job",
+        cascade="all, delete-orphan",
+    )
+
+
+class ImportJobEvent(Base):
+    """One timestamped progress event for an import job."""
+
+    __tablename__ = "import_job_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    job_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("import_jobs.id", ondelete="CASCADE"),
+        index=True,
+    )
+    level: Mapped[str] = mapped_column(String(32), default="info")
+    phase: Mapped[str] = mapped_column(String(128), default="")
+    message: Mapped[str] = mapped_column(Text)
+    file_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    job: Mapped[ImportJob] = relationship(back_populates="events")
+
+
+class ImportJobFile(Base):
+    """Persistent per-file state for resumable directory synchronization."""
+
+    __tablename__ = "import_job_files"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    job_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("import_jobs.id", ondelete="CASCADE"),
+        index=True,
+    )
+    file_path: Mapped[str] = mapped_column(String(2048), index=True)
+    file_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    phase: Mapped[str] = mapped_column(String(128), default="等待处理")
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    document_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    modified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    job: Mapped[ImportJob] = relationship(back_populates="files")
+
+
 def get_engine(settings: Settings | None = None):
     """Create a SQLite engine for the configured database."""
     runtime_settings = settings or get_settings()
@@ -132,6 +216,7 @@ def init_database(settings: Settings | None = None) -> None:
     """Create all database tables if they do not exist."""
     engine = get_engine(settings)
     Base.metadata.create_all(engine)
+    _ensure_sqlite_columns(engine)
 
 
 def get_session_factory(settings: Settings | None = None) -> sessionmaker[Session]:
@@ -154,3 +239,16 @@ def session_scope(settings: Settings | None = None) -> Iterator[Session]:
     finally:
         session.close()
 
+
+def _ensure_sqlite_columns(engine) -> None:
+    """Add newly introduced SQLite columns for existing local databases."""
+    inspector = inspect(engine)
+    if "import_jobs" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("import_jobs")}
+    statements = []
+    if "deleted" not in columns:
+        statements.append("ALTER TABLE import_jobs ADD COLUMN deleted INTEGER DEFAULT 0")
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))

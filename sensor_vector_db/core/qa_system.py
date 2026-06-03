@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from sensor_vector_db.config.settings import Settings, get_settings
+from sensor_vector_db.core.import_jobs import classify_error
 from sensor_vector_db.core.llm_client import DeepseekChatClient, NullLLMClient
 from sensor_vector_db.core.search_engine import SearchEngine
 from sensor_vector_db.core.types import SearchResult
@@ -69,7 +70,7 @@ class QASystem:
         try:
             answer = str(self.llm_client.chat(messages, temperature=0.0))
         except Exception as exc:
-            answer = f"DeepSeek 调用失败：{exc}\n\n已返回本地检索来源，请人工核对。"
+            answer = f"{classify_error(exc, 'DeepSeek 问答')}\n\n已返回本地检索来源，请人工核对。"
         self._save_history(question, answer, results)
         return {"answer": answer, "sources": results}
 
@@ -111,4 +112,3 @@ class QASystem:
                     sources_json=json.dumps(source_payload, ensure_ascii=False),
                 )
             )
-

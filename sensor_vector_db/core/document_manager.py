@@ -26,7 +26,7 @@ from sensor_vector_db.utils.logger import get_logger
 
 
 logger = get_logger(__name__)
-ProgressCallback = Callable[[int, int, str], None]
+ProgressCallback = Callable[..., None]
 
 
 class DocumentManager:
@@ -52,13 +52,33 @@ class DocumentManager:
         progress_callback: ProgressCallback | None = None,
     ) -> ImportReport:
         """Import one file or all supported files under a directory."""
+        self._emit_progress(progress_callback, 0, 0, str(path), "扫描", "正在扫描支持的文件")
         files = iter_supported_files(path)
         report = ImportReport(scanned=len(files))
+        self._emit_progress(
+            progress_callback,
+            0,
+            len(files),
+            str(path),
+            "扫描完成",
+            f"发现 {len(files)} 个支持文件",
+        )
         for index, file_path in enumerate(files, start=1):
-            if progress_callback:
-                progress_callback(index, len(files), str(file_path))
             try:
-                status = self.import_file(file_path)
+                self._emit_progress(
+                    progress_callback,
+                    index,
+                    len(files),
+                    str(file_path),
+                    "准备处理",
+                    f"准备导入 {file_path.name}",
+                )
+                status = self.import_file(
+                    file_path,
+                    progress_callback=progress_callback,
+                    current_index=index,
+                    total_files=len(files),
+                )
                 if status == "imported":
                     report.imported += 1
                 elif status == "updated":
@@ -69,11 +89,34 @@ class DocumentManager:
                 logger.exception("Failed to import %s", file_path)
                 report.failed += 1
                 report.errors.append(ImportErrorItem(file_path, str(exc)))
+                self._emit_progress(
+                    progress_callback,
+                    index,
+                    len(files),
+                    str(file_path),
+                    "失败",
+                    str(exc),
+                    level="error",
+                )
         return report
 
-    def import_file(self, path: str | Path) -> str:
+    def import_file(
+        self,
+        path: str | Path,
+        progress_callback: ProgressCallback | None = None,
+        current_index: int = 1,
+        total_files: int = 1,
+    ) -> str:
         """Import or update one supported file."""
         file_path = Path(path).resolve()
+        self._emit_progress(
+            progress_callback,
+            current_index,
+            total_files,
+            str(file_path),
+            "计算哈希",
+            "正在计算文件哈希用于去重",
+        )
         file_hash = calculate_file_md5(file_path)
         file_info = get_file_info(file_path)
         with session_scope(self.settings) as session:
@@ -81,8 +124,24 @@ class DocumentManager:
                 select(Document).where(Document.file_path == str(file_path))
             ).scalar_one_or_none()
             if existing and existing.file_hash == file_hash:
+                self._emit_progress(
+                    progress_callback,
+                    current_index,
+                    total_files,
+                    str(file_path),
+                    "跳过",
+                    "文件未变化，跳过入库",
+                )
                 return "skipped"
             if existing:
+                self._emit_progress(
+                    progress_callback,
+                    current_index,
+                    total_files,
+                    str(file_path),
+                    "更新",
+                    "检测到文件变化，删除旧向量并重新入库",
+                )
                 self.vector_store.delete_by_document_id(existing.id)
                 session.delete(existing)
                 session.flush()
@@ -90,12 +149,50 @@ class DocumentManager:
             else:
                 status = "imported"
 
+        self._emit_progress(
+            progress_callback,
+            current_index,
+            total_files,
+            str(file_path),
+            "解析文档",
+            "正在解析正文、表格或 OCR 文本",
+        )
         segments = self.parser_factory.parse(file_path)
+        self._emit_progress(
+            progress_callback,
+            current_index,
+            total_files,
+            str(file_path),
+            "文档分块",
+            f"解析得到 {len(segments)} 个片段，正在分块",
+        )
         chunks = self.chunker.chunk(segments)
         if not chunks:
             raise RuntimeError("No indexable text was extracted from the file.")
         metadata = self.metadata_extractor.extract(file_path, segments)
 
+        documents = [chunk.content for chunk in chunks]
+        self._emit_progress(
+            progress_callback,
+            current_index,
+            total_files,
+            str(file_path),
+            "向量化",
+            f"正在生成 {len(documents)} 个文本块的 embedding",
+        )
+        embeddings = self.embedding.embed_texts(documents)
+
+        self._emit_progress(
+            progress_callback,
+            current_index,
+            total_files,
+            str(file_path),
+            "写入元数据",
+            f"正在写入 SQLite，chunk 数：{len(chunks)}",
+        )
+        document_id: str | None = None
+        chunk_ids: list[str] = []
+        metadatas: list[dict] = []
         with session_scope(self.settings) as session:
             document = Document(
                 file_path=str(file_path),
@@ -115,15 +212,36 @@ class DocumentManager:
             )
             session.add(document)
             session.flush()
+            document_id = document.id
             db_chunks = self._persist_chunks(session, document, chunks)
             chunk_ids = [chunk.id for chunk in db_chunks]
-            documents = [chunk.content for chunk in db_chunks]
-            embeddings = self.embedding.embed_texts(documents)
             metadatas = [
                 self._chunk_metadata(document, chunk)
                 for chunk in db_chunks
             ]
+
+        self._emit_progress(
+            progress_callback,
+            current_index,
+            total_files,
+            str(file_path),
+            "写入向量库",
+            "正在写入 ChromaDB",
+        )
+        try:
             self.vector_store.add_chunks(chunk_ids, documents, embeddings, metadatas)
+        except Exception:
+            if document_id:
+                self.delete_document(document_id)
+            raise
+        self._emit_progress(
+            progress_callback,
+            current_index,
+            total_files,
+            str(file_path),
+            "完成文件",
+            f"{file_path.name} 已{status}",
+        )
         return status
 
     def list_documents(self) -> list[dict]:
@@ -206,3 +324,20 @@ class DocumentManager:
             "content_type": chunk.content_type,
         }
 
+    @staticmethod
+    def _emit_progress(
+        callback: ProgressCallback | None,
+        current: int,
+        total: int,
+        file_path: str,
+        phase: str,
+        message: str,
+        level: str = "info",
+    ) -> None:
+        """Call progress callback while keeping backward compatibility."""
+        if not callback:
+            return
+        try:
+            callback(current, total, file_path, phase, message, level)
+        except TypeError:
+            callback(current, total, file_path)
