@@ -3,6 +3,7 @@
 data/
 logs/
 sensor/
+传感器技术文档向量数据库系统 - 分阶段开发分步提示词.md
 __pycache__/
 *.py[cod]
 .pytest_cache/
