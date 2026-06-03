@@ -21,7 +21,6 @@ cols[2].metric("Vectors", stats["vectors"])
 documents = manager.list_documents()
 if documents:
     st.subheader("最近导入")
-    st.dataframe(documents[:20], use_container_width=True, hide_index=True)
+    st.dataframe(documents[:20], width="stretch", hide_index=True)
 else:
     st.info("尚未导入文档。")
-

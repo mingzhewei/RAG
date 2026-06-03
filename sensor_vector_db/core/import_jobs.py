@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 from dataclasses import dataclass
 from datetime import datetime
 import json
@@ -20,6 +21,7 @@ from sensor_vector_db.models.database import (
     ImportJobFile,
     init_database,
     session_scope,
+    utc_now,
 )
 from sensor_vector_db.utils.file_utils import get_file_info, iter_supported_files
 from sensor_vector_db.utils.hash_utils import calculate_file_md5
@@ -28,8 +30,13 @@ from sensor_vector_db.utils.logger import get_logger
 
 logger = get_logger(__name__)
 _RUNNING_THREADS: dict[str, threading.Thread] = {}
+_STOP_EVENTS: dict[str, threading.Event] = {}
 _THREAD_LOCK = threading.Lock()
 RETRYABLE_FILE_STATUSES = {"pending", "processing", "failed"}
+
+
+class ImportCancelled(RuntimeError):
+    """Raised when an import job has been asked to stop."""
 
 
 @dataclass
@@ -65,7 +72,13 @@ class ImportJobSnapshot:
     @property
     def can_resume(self) -> bool:
         """Return whether this job can be resumed by the UI."""
-        return self.status in {"queued", "running", "failed", "completed_with_errors"} and not self.is_thread_active
+        return self.status in {
+            "queued",
+            "running",
+            "interrupted",
+            "failed",
+            "completed_with_errors",
+        } and not self.is_thread_active
 
 
 class ImportJobManager:
@@ -112,14 +125,27 @@ class ImportJobManager:
             thread = _RUNNING_THREADS.get(job_id)
             if thread and thread.is_alive():
                 return
+            stop_event = threading.Event()
             new_thread = threading.Thread(
                 target=self._run_import,
-                args=(job_id,),
+                args=(job_id, stop_event),
                 name=f"import-job-{job_id[:8]}",
                 daemon=True,
             )
+            _STOP_EVENTS[job_id] = stop_event
             _RUNNING_THREADS[job_id] = new_thread
             new_thread.start()
+
+    def request_stop(self, job_id: str) -> None:
+        """Ask a running import job to stop at the next safe checkpoint."""
+        with _THREAD_LOCK:
+            stop_event = _STOP_EVENTS.get(job_id)
+            if stop_event:
+                stop_event.set()
+
+    def request_stop_all(self) -> None:
+        """Ask all running import jobs to stop at the next safe checkpoint."""
+        request_stop_all_running_jobs()
 
     def list_jobs(self, limit: int = 20) -> list[ImportJobSnapshot]:
         """Return recent import jobs."""
@@ -178,18 +204,35 @@ class ImportJobManager:
                 for row in rows
             ]
 
-    def _run_import(self, job_id: str) -> None:
+    def _run_import(self, job_id: str, stop_event: threading.Event) -> None:
         """Background thread target."""
         try:
             source_path = self._mark_started(job_id)
             manager = DocumentManager(self.settings)
+            self._raise_if_cancelled(stop_event)
             self._prepare_plan(job_id, source_path, manager)
             pending_files = self._get_retryable_files(job_id)
 
             for sequence, file_row_id in enumerate(pending_files, start=1):
-                self._process_one_file(job_id, file_row_id, sequence, len(pending_files), manager)
+                self._raise_if_cancelled(stop_event)
+                self._process_one_file(
+                    job_id,
+                    file_row_id,
+                    sequence,
+                    len(pending_files),
+                    manager,
+                    stop_event,
+                )
 
             self._finish_from_file_rows(job_id)
+        except ImportCancelled:
+            self._mark_finished(
+                job_id,
+                status="interrupted",
+                phase="已停止",
+                message="收到停止请求，导入任务已在安全检查点中断，可稍后恢复。",
+                report={"error": "cancelled"},
+            )
         except Exception as exc:
             logger.exception("Import job failed: %s", job_id)
             self._mark_finished(
@@ -202,6 +245,7 @@ class ImportJobManager:
         finally:
             with _THREAD_LOCK:
                 _RUNNING_THREADS.pop(job_id, None)
+                _STOP_EVENTS.pop(job_id, None)
 
     def _prepare_plan(self, job_id: str, source_path: str, manager: DocumentManager) -> None:
         """Scan source path, plan retries/skips, and remove deleted documents."""
@@ -216,7 +260,7 @@ class ImportJobManager:
                 job.deleted = deleted_count
                 job.total_files = len(files)
                 job.current_index = 0
-                job.updated_at = datetime.utcnow()
+                job.updated_at = utc_now()
             for row in session.execute(
                 select(ImportJobFile).where(
                     ImportJobFile.job_id == job_id,
@@ -226,7 +270,7 @@ class ImportJobManager:
                 row.status = "pending"
                 row.phase = "恢复排队"
                 row.message = "上次任务中断，已重新加入待处理队列"
-                row.updated_at = datetime.utcnow()
+                row.updated_at = utc_now()
 
         for index, file_path in enumerate(files, start=1):
             self._update_job(
@@ -254,8 +298,10 @@ class ImportJobManager:
         sequence: int,
         total_pending: int,
         manager: DocumentManager,
+        stop_event: threading.Event,
     ) -> None:
         """Process one planned file and persist its final state."""
+        self._raise_if_cancelled(stop_event)
         with session_scope(self.settings) as session:
             row = session.get(ImportJobFile, file_row_id)
             if not row:
@@ -264,8 +310,8 @@ class ImportJobManager:
             row.status = "processing"
             row.phase = "开始处理"
             row.message = f"正在处理待办 {sequence}/{total_pending}"
-            row.started_at = row.started_at or datetime.utcnow()
-            row.updated_at = datetime.utcnow()
+            row.started_at = row.started_at or utc_now()
+            row.updated_at = utc_now()
 
         def progress(
             current: int,
@@ -276,6 +322,7 @@ class ImportJobManager:
             level: str = "info",
         ) -> None:
             del current, total
+            self._raise_if_cancelled(stop_event)
             self._update_file_progress(job_id, file_row_id, path, phase, message, level)
 
         try:
@@ -286,10 +333,19 @@ class ImportJobManager:
                 total_files=total_pending,
             )
             self._mark_file_success(job_id, file_row_id, status)
+        except ImportCancelled:
+            self._mark_file_interrupted(job_id, file_row_id)
+            raise
         except Exception as exc:
             self._mark_file_failed(job_id, file_row_id, exc)
         finally:
             self._update_counts(job_id)
+
+    @staticmethod
+    def _raise_if_cancelled(stop_event: threading.Event) -> None:
+        """Raise when a running job has been asked to stop."""
+        if stop_event.is_set():
+            raise ImportCancelled("Import job was cancelled.")
 
     def _upsert_file_plan(self, job_id: str, file_path: Path) -> None:
         """Create or update one file row based on current hash and document state."""
@@ -305,6 +361,12 @@ class ImportJobManager:
             existing_doc = session.execute(
                 select(Document).where(Document.file_path == resolved)
             ).scalar_one_or_none()
+            reusable_doc = session.execute(
+                select(Document)
+                .where(Document.file_hash == file_hash)
+                .order_by(Document.imported_at)
+                .limit(1)
+            ).scalar_one_or_none()
             row = session.execute(
                 select(ImportJobFile).where(
                     ImportJobFile.job_id == job_id,
@@ -318,7 +380,7 @@ class ImportJobManager:
             row.file_hash = file_hash
             row.size_bytes = info.size_bytes
             row.modified_at = info.modified_at
-            row.updated_at = datetime.utcnow()
+            row.updated_at = utc_now()
 
             if existing_doc and existing_doc.file_hash == file_hash:
                 row.status = "skipped"
@@ -326,12 +388,17 @@ class ImportJobManager:
                 row.message = "文件未变化，已有向量，跳过"
                 row.document_id = existing_doc.id
                 row.error_message = None
-                row.finished_at = datetime.utcnow()
+                row.finished_at = utc_now()
             else:
                 row.status = "pending"
-                row.phase = "等待处理"
-                row.message = "新增文件" if not existing_doc else "文件已修改，等待更新向量"
-                row.document_id = existing_doc.id if existing_doc else None
+                if reusable_doc:
+                    row.phase = "等待复用"
+                    row.message = "文件哈希已入库，等待复用已有向量"
+                    row.document_id = existing_doc.id if existing_doc else reusable_doc.id
+                else:
+                    row.phase = "等待处理"
+                    row.message = "新增文件" if not existing_doc else "文件已修改，等待更新向量"
+                    row.document_id = existing_doc.id if existing_doc else None
                 row.error_message = None
                 row.finished_at = None
 
@@ -352,8 +419,8 @@ class ImportJobManager:
             row.phase = "扫描失败"
             row.message = error
             row.error_message = error
-            row.updated_at = datetime.utcnow()
-            row.finished_at = datetime.utcnow()
+            row.updated_at = utc_now()
+            row.finished_at = utc_now()
         self._add_event(job_id, "扫描失败", error, file_path, level="error")
 
     def _reconcile_deleted_documents(
@@ -410,9 +477,9 @@ class ImportJobManager:
             job.status = "running"
             job.phase = "启动"
             job.message = "后台导入线程已启动"
-            job.started_at = job.started_at or datetime.utcnow()
+            job.started_at = job.started_at or utc_now()
             job.finished_at = None
-            job.updated_at = datetime.utcnow()
+            job.updated_at = utc_now()
             session.add(
                 ImportJobEvent(
                     job_id=job_id,
@@ -441,12 +508,12 @@ class ImportJobManager:
                 job.phase = phase
                 job.message = message
                 job.current_file = file_path
-                job.updated_at = datetime.utcnow()
+                job.updated_at = utc_now()
             if row:
                 row.status = "processing"
                 row.phase = phase
                 row.message = message
-                row.updated_at = datetime.utcnow()
+                row.updated_at = utc_now()
             session.add(
                 ImportJobEvent(
                     job_id=job_id,
@@ -472,8 +539,8 @@ class ImportJobManager:
             row.document_id = document.id if document else row.document_id
             row.file_hash = document.file_hash if document else row.file_hash
             row.error_message = None
-            row.updated_at = datetime.utcnow()
-            row.finished_at = datetime.utcnow()
+            row.updated_at = utc_now()
+            row.finished_at = utc_now()
             session.add(
                 ImportJobEvent(
                     job_id=job_id,
@@ -495,14 +562,35 @@ class ImportJobManager:
             row.status = "failed"
             row.message = error
             row.error_message = error
-            row.updated_at = datetime.utcnow()
-            row.finished_at = datetime.utcnow()
+            row.updated_at = utc_now()
+            row.finished_at = utc_now()
             session.add(
                 ImportJobEvent(
                     job_id=job_id,
                     level="error",
                     phase="文件失败",
                     message=f"{Path(row.file_path).name}：{error}",
+                    file_path=row.file_path,
+                )
+            )
+
+    def _mark_file_interrupted(self, job_id: str, file_row_id: str) -> None:
+        """Return an interrupted file row to pending so it can be resumed."""
+        with session_scope(self.settings) as session:
+            row = session.get(ImportJobFile, file_row_id)
+            if not row:
+                return
+            row.status = "pending"
+            row.phase = "已停止"
+            row.message = "收到停止请求，稍后可恢复处理"
+            row.error_message = None
+            row.updated_at = utc_now()
+            session.add(
+                ImportJobEvent(
+                    job_id=job_id,
+                    level="info",
+                    phase="已停止",
+                    message=f"{Path(row.file_path).name}：收到停止请求，稍后可恢复处理",
                     file_path=row.file_path,
                 )
             )
@@ -541,7 +629,7 @@ class ImportJobManager:
                 job.failed = counts["failed"]
                 completed = counts["imported"] + counts["updated"] + counts["skipped"] + counts["failed"]
                 job.current_index = min(completed, counts["scanned"])
-                job.updated_at = datetime.utcnow()
+                job.updated_at = utc_now()
             return counts
 
     def _update_job(
@@ -566,7 +654,7 @@ class ImportJobManager:
                 job.current_index = current_index
             if total_files is not None:
                 job.total_files = total_files
-            job.updated_at = datetime.utcnow()
+            job.updated_at = utc_now()
             session.add(
                 ImportJobEvent(
                     job_id=job_id,
@@ -592,8 +680,8 @@ class ImportJobManager:
             job.status = status
             job.phase = phase
             job.message = message
-            job.finished_at = datetime.utcnow()
-            job.updated_at = datetime.utcnow()
+            job.finished_at = utc_now()
+            job.updated_at = utc_now()
             job.report_json = json.dumps(report, ensure_ascii=False, default=str)
             job.imported = int(report.get("imported", job.imported or 0))
             job.updated = int(report.get("updated", job.updated or 0))
@@ -640,7 +728,9 @@ class ImportJobManager:
                 select(ImportJob)
                 .where(
                     ImportJob.source_path == source_path,
-                    ImportJob.status.in_({"queued", "running", "failed", "completed_with_errors"}),
+                    ImportJob.status.in_(
+                        {"queued", "running", "interrupted", "failed", "completed_with_errors"}
+                    ),
                 )
                 .order_by(desc(ImportJob.created_at))
                 .limit(1)
@@ -707,7 +797,7 @@ def _success_message(status: str) -> str:
     return {
         "imported": "新增文件已完成向量化",
         "updated": "已更新文件向量",
-        "skipped": "文件未变化，已跳过",
+        "skipped": "文件未变化或哈希已入库，已跳过重复向量化",
     }.get(status, status)
 
 
@@ -718,3 +808,13 @@ def _is_under_root(file_path: str, root: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def request_stop_all_running_jobs() -> None:
+    """Ask all import worker threads to stop without blocking interpreter shutdown."""
+    with _THREAD_LOCK:
+        for stop_event in _STOP_EVENTS.values():
+            stop_event.set()
+
+
+atexit.register(request_stop_all_running_jobs)

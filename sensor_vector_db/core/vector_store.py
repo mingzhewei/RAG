@@ -50,6 +50,24 @@ class VectorStore:
         except Exception as exc:
             raise RuntimeError(f"Failed to upsert chunks into ChromaDB: {exc}") from exc
 
+    def get_embeddings(self, chunk_ids: list[str]) -> dict[str, list[float]]:
+        """Return stored embeddings keyed by chunk ID."""
+        if not chunk_ids:
+            return {}
+        try:
+            result = self.collection.get(ids=chunk_ids, include=["embeddings"])
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read embeddings from ChromaDB: {exc}") from exc
+
+        ids = result.get("ids") or []
+        embeddings = result.get("embeddings")
+        if embeddings is None:
+            embeddings = []
+        return {
+            chunk_id: _embedding_to_list(embedding)
+            for chunk_id, embedding in zip(ids, embeddings, strict=False)
+        }
+
     def query(
         self,
         query_embedding: list[float],
@@ -129,6 +147,13 @@ def _clean_metadata(metadata: dict[str, Any]) -> dict[str, str | int | float | b
     return cleaned
 
 
+def _embedding_to_list(embedding: Any) -> list[float]:
+    """Convert a stored embedding into a JSON-compatible float list."""
+    if hasattr(embedding, "tolist"):
+        embedding = embedding.tolist()
+    return [float(value) for value in embedding]
+
+
 def _maybe_int(value: Any) -> int | None:
     """Best-effort integer conversion."""
     if value in (None, ""):
@@ -137,4 +162,3 @@ def _maybe_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-

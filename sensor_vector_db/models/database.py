@@ -2,7 +2,7 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 import uuid
 
 from sqlalchemy import (
@@ -31,6 +31,11 @@ def new_id() -> str:
     return str(uuid.uuid4())
 
 
+def utc_now() -> datetime:
+    """Return a naive UTC timestamp for SQLite compatibility."""
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
 class Document(Base):
     """Imported source document metadata."""
 
@@ -44,7 +49,7 @@ class Document(Base):
     size_bytes: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     modified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    imported_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     status: Mapped[str] = mapped_column(String(32), default="imported", index=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     manufacturer: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
@@ -80,7 +85,7 @@ class DocumentChunk(Base):
     page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     source_label: Mapped[str] = mapped_column(String(512))
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
     document: Mapped[Document] = relationship(back_populates="chunks")
 
@@ -105,7 +110,7 @@ class ExtractedParameter(Base):
     page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     confidence: Mapped[float] = mapped_column(Float, default=0.7)
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
     document: Mapped[Document] = relationship(back_populates="parameters")
 
@@ -120,7 +125,7 @@ class QueryHistory(Base):
     query_type: Mapped[str] = mapped_column(String(64), index=True)
     answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     sources_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
 
 class ImportJob(Base):
@@ -142,9 +147,9 @@ class ImportJob(Base):
     deleted: Mapped[int] = mapped_column(Integer, default=0)
     failed: Mapped[int] = mapped_column(Integer, default=0)
     report_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     events: Mapped[list["ImportJobEvent"]] = relationship(
@@ -172,7 +177,7 @@ class ImportJobEvent(Base):
     phase: Mapped[str] = mapped_column(String(128), default="")
     message: Mapped[str] = mapped_column(Text)
     file_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
     job: Mapped[ImportJob] = relationship(back_populates="events")
 
@@ -197,9 +202,9 @@ class ImportJobFile(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     size_bytes: Mapped[int] = mapped_column(Integer, default=0)
     modified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     job: Mapped[ImportJob] = relationship(back_populates="files")

@@ -40,7 +40,7 @@ if selected and st.button("抽取参数", type="primary"):
         for item in parameters
     ]
     st.success(f"抽取到 {len(rows)} 个证据参数")
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 if not documents:
     st.info("尚未导入文档。")

@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 import json
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from sqlalchemy import select
 
@@ -19,7 +18,7 @@ from sensor_vector_db.core.document_processor import (
 from sensor_vector_db.core.embedding import BaseEmbedding, create_embedding_provider
 from sensor_vector_db.core.types import ImportErrorItem, ImportReport, TextChunk
 from sensor_vector_db.core.vector_store import VectorStore
-from sensor_vector_db.models.database import Document, DocumentChunk, session_scope
+from sensor_vector_db.models.database import Document, DocumentChunk, session_scope, utc_now
 from sensor_vector_db.utils.file_utils import get_file_info, iter_supported_files
 from sensor_vector_db.utils.hash_utils import calculate_file_md5
 from sensor_vector_db.utils.logger import get_logger
@@ -119,6 +118,9 @@ class DocumentManager:
         )
         file_hash = calculate_file_md5(file_path)
         file_info = get_file_info(file_path)
+        existing_document_id: str | None = None
+        existing_snapshot: dict[str, Any] | None = None
+        reuse_source_snapshot: dict[str, Any] | None = None
         with session_scope(self.settings) as session:
             existing = session.execute(
                 select(Document).where(Document.file_path == str(file_path))
@@ -134,20 +136,37 @@ class DocumentManager:
                 )
                 return "skipped"
             if existing:
+                existing_document_id = existing.id
+                existing_snapshot = self._snapshot_document(session, existing)
                 self._emit_progress(
                     progress_callback,
                     current_index,
                     total_files,
                     str(file_path),
                     "更新",
-                    "检测到文件变化，删除旧向量并重新入库",
+                    "检测到文件变化，准备生成新向量并替换旧索引",
                 )
-                self.vector_store.delete_by_document_id(existing.id)
-                session.delete(existing)
-                session.flush()
                 status = "updated"
             else:
                 status = "imported"
+            reusable = self._find_reusable_document(session, file_hash, existing_document_id)
+            if reusable:
+                reuse_source_snapshot = self._snapshot_document(session, reusable)
+
+        if reuse_source_snapshot:
+            reused_status = self._try_reuse_indexed_document(
+                file_path=file_path,
+                file_hash=file_hash,
+                file_info=file_info,
+                source_snapshot=reuse_source_snapshot,
+                existing_document_id=existing_document_id,
+                existing_snapshot=existing_snapshot,
+                progress_callback=progress_callback,
+                current_index=current_index,
+                total_files=total_files,
+            )
+            if reused_status:
+                return reused_status
 
         self._emit_progress(
             progress_callback,
@@ -194,6 +213,15 @@ class DocumentManager:
         chunk_ids: list[str] = []
         metadatas: list[dict] = []
         with session_scope(self.settings) as session:
+            if existing_document_id:
+                existing = session.get(Document, existing_document_id)
+                if not existing:
+                    existing = session.execute(
+                        select(Document).where(Document.file_path == str(file_path))
+                    ).scalar_one_or_none()
+                if existing:
+                    session.delete(existing)
+                    session.flush()
             document = Document(
                 file_path=str(file_path),
                 filename=file_path.name,
@@ -202,7 +230,7 @@ class DocumentManager:
                 size_bytes=file_info.size_bytes,
                 created_at=file_info.created_at,
                 modified_at=file_info.modified_at,
-                imported_at=datetime.utcnow(),
+                imported_at=utc_now(),
                 status="imported",
                 manufacturer=metadata.get("manufacturer"),
                 sensor_model=metadata.get("sensor_model"),
@@ -233,7 +261,14 @@ class DocumentManager:
         except Exception:
             if document_id:
                 self.delete_document(document_id)
+            if existing_snapshot:
+                try:
+                    self._restore_document_snapshot(existing_snapshot)
+                except Exception:
+                    logger.exception("Failed to restore previous document after vector write failure")
             raise
+        if existing_document_id:
+            self.vector_store.delete_by_document_id(existing_document_id)
         self._emit_progress(
             progress_callback,
             current_index,
@@ -283,6 +318,241 @@ class DocumentManager:
             "vectors": self.vector_store.count(),
         }
 
+    def _find_reusable_document(
+        self,
+        session,
+        file_hash: str,
+        exclude_document_id: str | None = None,
+    ) -> Document | None:
+        """Return an already indexed document with the same file content hash."""
+        statement = select(Document).where(Document.file_hash == file_hash)
+        if exclude_document_id:
+            statement = statement.where(Document.id != exclude_document_id)
+        documents = session.execute(statement.order_by(Document.imported_at)).scalars().all()
+        for document in documents:
+            chunk_id = session.execute(
+                select(DocumentChunk.id)
+                .where(DocumentChunk.document_id == document.id)
+                .limit(1)
+            ).scalar_one_or_none()
+            if chunk_id:
+                return document
+        return None
+
+    def _try_reuse_indexed_document(
+        self,
+        file_path: Path,
+        file_hash: str,
+        file_info: Any,
+        source_snapshot: dict[str, Any],
+        existing_document_id: str | None,
+        existing_snapshot: dict[str, Any] | None,
+        progress_callback: ProgressCallback | None,
+        current_index: int,
+        total_files: int,
+    ) -> str | None:
+        """Create a document for this path by reusing chunks and embeddings from the same hash."""
+        source_document = source_snapshot["document"]
+        source_chunks = source_snapshot["chunks"]
+        if not source_chunks:
+            return None
+
+        self._emit_progress(
+            progress_callback,
+            current_index,
+            total_files,
+            str(file_path),
+            "复用文件哈希",
+            f"文件哈希已入库，复用 {source_document['filename']} 的分块和向量",
+        )
+
+        document_id: str | None = None
+        source_to_target: dict[str, str] = {}
+        target_documents: dict[str, str] = {}
+        target_metadatas: dict[str, dict] = {}
+
+        try:
+            with session_scope(self.settings) as session:
+                if existing_document_id:
+                    existing = session.get(Document, existing_document_id)
+                    if not existing:
+                        existing = session.execute(
+                            select(Document).where(Document.file_path == str(file_path))
+                        ).scalar_one_or_none()
+                    if existing:
+                        session.delete(existing)
+                        session.flush()
+
+                document = Document(
+                    file_path=str(file_path),
+                    filename=file_path.name,
+                    file_type=file_info.file_type,
+                    file_hash=file_hash,
+                    size_bytes=file_info.size_bytes,
+                    created_at=file_info.created_at,
+                    modified_at=file_info.modified_at,
+                    imported_at=utc_now(),
+                    status="imported",
+                    manufacturer=source_document.get("manufacturer"),
+                    sensor_model=source_document.get("sensor_model"),
+                    tags=source_document.get("tags"),
+                    notes=source_document.get("notes"),
+                    metadata_json=self._reused_metadata_json(
+                        file_path,
+                        file_info,
+                        file_hash,
+                        source_document,
+                    ),
+                )
+                session.add(document)
+                session.flush()
+                document_id = document.id
+
+                for source_chunk in source_chunks:
+                    db_chunk = DocumentChunk(
+                        document_id=document.id,
+                        chunk_index=source_chunk["chunk_index"],
+                        content=source_chunk["content"],
+                        content_type=source_chunk["content_type"],
+                        page_number=source_chunk["page_number"],
+                        source_label=self._source_label(
+                            document.filename,
+                            source_chunk["page_number"],
+                            source_chunk["chunk_index"],
+                        ),
+                        metadata_json=source_chunk["metadata_json"],
+                    )
+                    session.add(db_chunk)
+                    session.flush()
+                    source_to_target[source_chunk["id"]] = db_chunk.id
+                    target_documents[db_chunk.id] = db_chunk.content
+                    target_metadatas[db_chunk.id] = self._chunk_metadata(document, db_chunk)
+
+            source_embeddings = self.vector_store.get_embeddings(list(source_to_target))
+            missing = [
+                source_id
+                for source_id in source_to_target
+                if source_id not in source_embeddings
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"Existing vectors are incomplete for reused hash {file_hash}: {len(missing)} missing"
+                )
+
+            source_ids = list(source_to_target)
+            target_ids = [source_to_target[source_id] for source_id in source_ids]
+            self.vector_store.add_chunks(
+                target_ids,
+                [target_documents[chunk_id] for chunk_id in target_ids],
+                [source_embeddings[source_id] for source_id in source_ids],
+                [target_metadatas[chunk_id] for chunk_id in target_ids],
+            )
+        except Exception as exc:
+            if document_id:
+                self.delete_document(document_id)
+            if existing_snapshot:
+                try:
+                    self._restore_document_snapshot(existing_snapshot)
+                except Exception:
+                    logger.exception("Failed to restore previous document after hash reuse failure")
+            logger.warning("Hash reuse failed for %s, falling back to full import: %s", file_path, exc)
+            return None
+
+        if existing_document_id:
+            self.vector_store.delete_by_document_id(existing_document_id)
+
+        status = "updated" if existing_document_id else "skipped"
+        self._emit_progress(
+            progress_callback,
+            current_index,
+            total_files,
+            str(file_path),
+            "完成文件",
+            f"{file_path.name} 已复用相同哈希的向量",
+        )
+        return status
+
+    @staticmethod
+    def _reused_metadata_json(
+        file_path: Path,
+        file_info: Any,
+        file_hash: str,
+        source_document: dict[str, Any],
+    ) -> str:
+        """Build metadata for a duplicate path that reuses an indexed hash."""
+        try:
+            metadata = json.loads(source_document.get("metadata_json") or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
+        metadata.update(
+            {
+                "filename": file_path.name,
+                "file_path": str(file_path),
+                "file_type": file_info.file_type,
+                "size_bytes": file_info.size_bytes,
+                "created_at": file_info.created_at,
+                "modified_at": file_info.modified_at,
+                "file_hash": file_hash,
+                "reused_from_document_id": source_document.get("id"),
+                "reused_from_file_path": source_document.get("file_path"),
+            }
+        )
+        return metadata_to_json(metadata)
+
+    def _snapshot_document(self, session, document: Document) -> dict[str, Any]:
+        """Copy a document and its chunks so an interrupted update can be restored."""
+        chunks = session.execute(
+            select(DocumentChunk).where(DocumentChunk.document_id == document.id)
+        ).scalars().all()
+        return {
+            "document": {
+                "id": document.id,
+                "file_path": document.file_path,
+                "filename": document.filename,
+                "file_type": document.file_type,
+                "file_hash": document.file_hash,
+                "size_bytes": document.size_bytes,
+                "created_at": document.created_at,
+                "modified_at": document.modified_at,
+                "imported_at": document.imported_at,
+                "status": document.status,
+                "error_message": document.error_message,
+                "manufacturer": document.manufacturer,
+                "sensor_model": document.sensor_model,
+                "tags": document.tags,
+                "notes": document.notes,
+                "metadata_json": document.metadata_json,
+            },
+            "chunks": [
+                {
+                    "id": chunk.id,
+                    "document_id": chunk.document_id,
+                    "chunk_index": chunk.chunk_index,
+                    "content": chunk.content,
+                    "content_type": chunk.content_type,
+                    "page_number": chunk.page_number,
+                    "source_label": chunk.source_label,
+                    "metadata_json": chunk.metadata_json,
+                    "created_at": chunk.created_at,
+                }
+                for chunk in chunks
+            ],
+        }
+
+    def _restore_document_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Restore a previously indexed document after a failed update."""
+        document_data = snapshot["document"]
+        with session_scope(self.settings) as session:
+            current = session.execute(
+                select(Document).where(Document.file_path == document_data["file_path"])
+            ).scalar_one_or_none()
+            if current:
+                session.delete(current)
+                session.flush()
+            session.add(Document(**document_data))
+            for chunk_data in snapshot["chunks"]:
+                session.add(DocumentChunk(**chunk_data))
+
     def _persist_chunks(
         self,
         session,
@@ -292,21 +562,29 @@ class DocumentManager:
         """Persist chunk rows and return them."""
         db_chunks: list[DocumentChunk] = []
         for chunk in chunks:
-            page = f" p.{chunk.page_number}" if chunk.page_number else ""
-            source_label = f"{document.filename}{page} #{chunk.chunk_index}"
             db_chunk = DocumentChunk(
                 document_id=document.id,
                 chunk_index=chunk.chunk_index,
                 content=chunk.content,
                 content_type=chunk.content_type,
                 page_number=chunk.page_number,
-                source_label=source_label,
+                source_label=self._source_label(
+                    document.filename,
+                    chunk.page_number,
+                    chunk.chunk_index,
+                ),
                 metadata_json=json.dumps(chunk.metadata, ensure_ascii=False, default=str),
             )
             session.add(db_chunk)
             db_chunks.append(db_chunk)
         session.flush()
         return db_chunks
+
+    @staticmethod
+    def _source_label(filename: str, page_number: int | None, chunk_index: int) -> str:
+        """Build a compact source label for one document chunk."""
+        page = f" p.{page_number}" if page_number else ""
+        return f"{filename}{page} #{chunk_index}"
 
     @staticmethod
     def _chunk_metadata(document: Document, chunk: DocumentChunk) -> dict:
@@ -316,6 +594,7 @@ class DocumentManager:
             "source_label": chunk.source_label,
             "file_path": document.file_path,
             "file_type": document.file_type,
+            "file_hash": document.file_hash,
             "filename": document.filename,
             "page_number": chunk.page_number,
             "sensor_model": document.sensor_model,

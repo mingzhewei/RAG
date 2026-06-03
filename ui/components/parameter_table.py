@@ -24,5 +24,4 @@ def render_comparison(
                 else "未找到\n来源: 未在已入库文档中找到依据"
             )
         rows.append(row)
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)

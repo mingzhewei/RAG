@@ -70,19 +70,23 @@ if job:
     if job.current_file:
         st.caption(f"当前文件：{job.current_file}")
 
-    action_cols = st.columns([0.18, 0.82])
+    action_cols = st.columns([0.18, 0.18, 0.64])
     if action_cols[0].button("恢复该任务", disabled=not job.can_resume):
         job_manager.resume_job(job.id)
         st.success("恢复指令已发送。")
         st.rerun()
-    action_cols[1].caption(
+    if action_cols[1].button("停止该任务", disabled=not job.is_thread_active):
+        job_manager.request_stop(job.id)
+        st.info("停止请求已发送，任务会在下一个安全检查点中断。")
+        st.rerun()
+    action_cols[2].caption(
         "如果上次关机或服务重启导致任务停在 running，但后台线程未运行，可点击恢复。"
     )
 
     st.subheader("最近事件")
     events = job_manager.get_events(job.id, limit=120)
     if events:
-        st.dataframe(pd.DataFrame(events), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(events), width="stretch", hide_index=True)
     else:
         st.info("暂无事件。")
 
@@ -97,7 +101,7 @@ if job:
         filtered = [
             row for row in file_rows if not status_filter or row["status"] in status_filter
         ]
-        st.dataframe(pd.DataFrame(filtered), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(filtered), width="stretch", hide_index=True)
     else:
         st.info("任务尚未生成文件计划。")
 elif manual_refresh:
