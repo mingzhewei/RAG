@@ -16,6 +16,7 @@ from sensor_vector_db.core.document_processor import (
     metadata_to_json,
 )
 from sensor_vector_db.core.embedding import BaseEmbedding, create_embedding_provider
+from sensor_vector_db.core.index_profile import build_index_profile, profile_satisfies
 from sensor_vector_db.core.types import ImportErrorItem, ImportReport, TextChunk
 from sensor_vector_db.core.vector_store import VectorStore
 from sensor_vector_db.models.database import Document, DocumentChunk, session_scope, utc_now
@@ -103,10 +104,12 @@ class DocumentManager:
         self,
         path: str | Path,
         progress_callback: ProgressCallback | None = None,
+        cancel_callback: Callable[[], None] | None = None,
         current_index: int = 1,
         total_files: int = 1,
     ) -> str:
         """Import or update one supported file."""
+        self._check_cancelled(cancel_callback)
         file_path = Path(path).resolve()
         self._emit_progress(
             progress_callback,
@@ -118,6 +121,7 @@ class DocumentManager:
         )
         file_hash = calculate_file_md5(file_path)
         file_info = get_file_info(file_path)
+        target_profile = build_index_profile(self.settings)
         existing_document_id: str | None = None
         existing_snapshot: dict[str, Any] | None = None
         reuse_source_snapshot: dict[str, Any] | None = None
@@ -125,19 +129,25 @@ class DocumentManager:
             existing = session.execute(
                 select(Document).where(Document.file_path == str(file_path))
             ).scalar_one_or_none()
-            if existing and existing.file_hash == file_hash:
+            if (
+                existing
+                and existing.file_hash == file_hash
+                and existing.status == "imported"
+                and profile_satisfies(existing.index_profile, target_profile)
+            ):
                 self._emit_progress(
                     progress_callback,
                     current_index,
                     total_files,
                     str(file_path),
                     "跳过",
-                    "文件未变化，跳过入库",
+                    "文件未变化，且当前索引配置已满足目标，跳过入库",
                 )
                 return "skipped"
             if existing:
                 existing_document_id = existing.id
-                existing_snapshot = self._snapshot_document(session, existing)
+                if existing.status == "imported":
+                    existing_snapshot = self._snapshot_document(session, existing)
                 self._emit_progress(
                     progress_callback,
                     current_index,
@@ -149,7 +159,7 @@ class DocumentManager:
                 status = "updated"
             else:
                 status = "imported"
-            reusable = self._find_reusable_document(session, file_hash, existing_document_id)
+            reusable = self._find_reusable_document(session, file_hash, target_profile, existing_document_id)
             if reusable:
                 reuse_source_snapshot = self._snapshot_document(session, reusable)
 
@@ -159,6 +169,7 @@ class DocumentManager:
                 file_hash=file_hash,
                 file_info=file_info,
                 source_snapshot=reuse_source_snapshot,
+                target_profile=target_profile,
                 existing_document_id=existing_document_id,
                 existing_snapshot=existing_snapshot,
                 progress_callback=progress_callback,
@@ -176,7 +187,8 @@ class DocumentManager:
             "解析文档",
             "正在解析正文、表格或 OCR 文本",
         )
-        segments = self.parser_factory.parse(file_path)
+        segments = self.parser_factory.parse(file_path, cancel_callback=cancel_callback)
+        self._check_cancelled(cancel_callback)
         self._emit_progress(
             progress_callback,
             current_index,
@@ -199,7 +211,9 @@ class DocumentManager:
             "向量化",
             f"正在生成 {len(documents)} 个文本块的 embedding",
         )
+        self._check_cancelled(cancel_callback)
         embeddings = self.embedding.embed_texts(documents)
+        self._check_cancelled(cancel_callback)
 
         self._emit_progress(
             progress_callback,
@@ -231,12 +245,13 @@ class DocumentManager:
                 created_at=file_info.created_at,
                 modified_at=file_info.modified_at,
                 imported_at=utc_now(),
-                status="imported",
+                status="indexing",
                 manufacturer=metadata.get("manufacturer"),
                 sensor_model=metadata.get("sensor_model"),
                 tags=metadata.get("tags"),
                 notes=metadata.get("notes"),
                 metadata_json=metadata_to_json(metadata),
+                index_profile=target_profile,
             )
             session.add(document)
             session.flush()
@@ -269,6 +284,8 @@ class DocumentManager:
             raise
         if existing_document_id:
             self.vector_store.delete_by_document_id(existing_document_id)
+        if document_id:
+            self._mark_document_imported(document_id)
         self._emit_progress(
             progress_callback,
             current_index,
@@ -282,7 +299,11 @@ class DocumentManager:
     def list_documents(self) -> list[dict]:
         """Return imported documents for UI display."""
         with session_scope(self.settings) as session:
-            documents = session.execute(select(Document).order_by(Document.imported_at.desc()))
+            documents = session.execute(
+                select(Document)
+                .where(Document.status == "imported")
+                .order_by(Document.imported_at.desc())
+            )
             return [
                 {
                     "id": document.id,
@@ -310,26 +331,135 @@ class DocumentManager:
     def stats(self) -> dict[str, int]:
         """Return basic database statistics."""
         with session_scope(self.settings) as session:
-            document_count = len(session.execute(select(Document.id)).all())
-            chunk_count = len(session.execute(select(DocumentChunk.id)).all())
+            document_count = len(
+                session.execute(
+                    select(Document.id).where(Document.status == "imported")
+                ).all()
+            )
+            chunk_count = len(
+                session.execute(
+                    select(DocumentChunk.id)
+                    .join(Document, Document.id == DocumentChunk.document_id)
+                    .where(Document.status == "imported")
+                ).all()
+            )
         return {
             "documents": document_count,
             "chunks": chunk_count,
             "vectors": self.vector_store.count(),
         }
 
+    def refresh_sensor_models(self, overwrite: bool = True) -> dict[str, int]:
+        """Re-derive sensor model and manufacturer hints for imported documents.
+
+        Reuses the chunks already stored in SQLite, so no source file is parsed
+        and no embedding is recomputed. Updates the SQLite document row and the
+        affected Chroma chunk metadata in place.
+
+        Args:
+            overwrite: When True, replace existing hints; when False, only fill
+                fields that are currently empty.
+
+        Returns:
+            Counts of scanned and updated documents.
+        """
+        with session_scope(self.settings) as session:
+            document_ids = [
+                row[0]
+                for row in session.execute(
+                    select(Document.id).where(Document.status == "imported")
+                ).all()
+            ]
+        scanned = 0
+        updated = 0
+        for document_id in document_ids:
+            scanned += 1
+            if self._refresh_document_hints(document_id, overwrite):
+                updated += 1
+        return {"scanned": scanned, "updated": updated}
+
+    def _refresh_document_hints(self, document_id: str, overwrite: bool) -> bool:
+        """Recompute hints for one document from its stored chunks."""
+        chunk_ids_to_sync: list[str] = []
+        metadatas_to_sync: list[dict] = []
+        changed = False
+        with session_scope(self.settings) as session:
+            document = session.get(Document, document_id)
+            if not document or document.status != "imported":
+                return False
+            chunks = session.execute(
+                select(DocumentChunk)
+                .where(DocumentChunk.document_id == document_id)
+                .order_by(DocumentChunk.chunk_index)
+            ).scalars().all()
+            if not chunks:
+                return False
+            evidence = "\n".join(chunk.content for chunk in chunks[:5])
+            hints = self.metadata_extractor.extract_hints_from_text(evidence)
+            new_model = hints.get("sensor_model")
+            new_manufacturer = hints.get("manufacturer")
+
+            if (overwrite or not document.sensor_model) and (
+                new_model and new_model != document.sensor_model
+            ):
+                document.sensor_model = new_model
+                changed = True
+            if (overwrite or not document.manufacturer) and (
+                new_manufacturer and new_manufacturer != document.manufacturer
+            ):
+                document.manufacturer = new_manufacturer
+                changed = True
+
+            if changed:
+                document.metadata_json = self._merge_metadata_json(
+                    document.metadata_json,
+                    document.sensor_model,
+                    document.manufacturer,
+                )
+                chunk_ids_to_sync = [chunk.id for chunk in chunks]
+                metadatas_to_sync = [
+                    self._chunk_metadata(document, chunk) for chunk in chunks
+                ]
+
+        if changed and chunk_ids_to_sync:
+            self.vector_store.update_metadata(chunk_ids_to_sync, metadatas_to_sync)
+        return changed
+
+    @staticmethod
+    def _merge_metadata_json(
+        metadata_json: str | None,
+        sensor_model: str | None,
+        manufacturer: str | None,
+    ) -> str:
+        """Update stored metadata JSON with refreshed hints."""
+        try:
+            metadata = json.loads(metadata_json or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["sensor_model"] = sensor_model
+        metadata["manufacturer"] = manufacturer
+        return metadata_to_json(metadata)
+
     def _find_reusable_document(
         self,
         session,
         file_hash: str,
+        target_profile: str,
         exclude_document_id: str | None = None,
     ) -> Document | None:
         """Return an already indexed document with the same file content hash."""
-        statement = select(Document).where(Document.file_hash == file_hash)
+        statement = select(Document).where(
+            Document.file_hash == file_hash,
+            Document.status == "imported",
+        )
         if exclude_document_id:
             statement = statement.where(Document.id != exclude_document_id)
         documents = session.execute(statement.order_by(Document.imported_at)).scalars().all()
         for document in documents:
+            if not profile_satisfies(document.index_profile, target_profile):
+                continue
             chunk_id = session.execute(
                 select(DocumentChunk.id)
                 .where(DocumentChunk.document_id == document.id)
@@ -345,6 +475,7 @@ class DocumentManager:
         file_hash: str,
         file_info: Any,
         source_snapshot: dict[str, Any],
+        target_profile: str,
         existing_document_id: str | None,
         existing_snapshot: dict[str, Any] | None,
         progress_callback: ProgressCallback | None,
@@ -392,7 +523,7 @@ class DocumentManager:
                     created_at=file_info.created_at,
                     modified_at=file_info.modified_at,
                     imported_at=utc_now(),
-                    status="imported",
+                    status="indexing",
                     manufacturer=source_document.get("manufacturer"),
                     sensor_model=source_document.get("sensor_model"),
                     tags=source_document.get("tags"),
@@ -403,6 +534,7 @@ class DocumentManager:
                         file_hash,
                         source_document,
                     ),
+                    index_profile=source_document.get("index_profile") or target_profile,
                 )
                 session.add(document)
                 session.flush()
@@ -460,6 +592,8 @@ class DocumentManager:
 
         if existing_document_id:
             self.vector_store.delete_by_document_id(existing_document_id)
+        if document_id:
+            self._mark_document_imported(document_id)
 
         status = "updated" if existing_document_id else "skipped"
         self._emit_progress(
@@ -522,6 +656,7 @@ class DocumentManager:
                 "tags": document.tags,
                 "notes": document.notes,
                 "metadata_json": document.metadata_json,
+                "index_profile": document.index_profile,
             },
             "chunks": [
                 {
@@ -552,6 +687,15 @@ class DocumentManager:
             session.add(Document(**document_data))
             for chunk_data in snapshot["chunks"]:
                 session.add(DocumentChunk(**chunk_data))
+
+    def _mark_document_imported(self, document_id: str) -> None:
+        """Mark a document visible only after its vectors are durable."""
+        with session_scope(self.settings) as session:
+            document = session.get(Document, document_id)
+            if document:
+                document.status = "imported"
+                document.error_message = None
+                document.imported_at = utc_now()
 
     def _persist_chunks(
         self,
@@ -620,3 +764,9 @@ class DocumentManager:
             callback(current, total, file_path, phase, message, level)
         except TypeError:
             callback(current, total, file_path)
+
+    @staticmethod
+    def _check_cancelled(cancel_callback: Callable[[], None] | None) -> None:
+        """Run an optional cancellation checkpoint."""
+        if cancel_callback:
+            cancel_callback()

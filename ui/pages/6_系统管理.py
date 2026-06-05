@@ -45,6 +45,20 @@ st.write(
         "embedding_device": settings.embedding_device,
         "ocr_enabled": settings.ocr_enabled,
         "ocr_lang": settings.ocr_lang,
+        "ocr_max_pages_per_file": settings.ocr_max_pages_per_file,
+        "ocr_render_scale": settings.ocr_render_scale,
+        "native_thread_limit": settings.native_thread_limit,
     }
 )
+
+st.subheader("元数据维护")
+st.caption(
+    "用最新的型号/厂商识别规则重新解析已入库文档的现有分块，只更新元数据，"
+    "不重新解析原文件，也不重新计算向量。"
+)
+overwrite = st.checkbox("覆盖已有型号/厂商（取消则只补全空字段）", value=True)
+if st.button("重算已入库型号/厂商"):
+    with st.spinner("正在刷新元数据..."):
+        result = manager.refresh_sensor_models(overwrite=overwrite)
+    st.success(f"已扫描 {result['scanned']} 个文档，更新 {result['updated']} 个。")
 

@@ -9,10 +9,10 @@ import os
 from pathlib import Path
 import re
 import tempfile
-from typing import Any
+from typing import Any, Callable
 
 from sensor_vector_db.config.settings import Settings, get_settings
-from sensor_vector_db.core.types import ParsedSegment, TextChunk
+from sensor_vector_db.core.types import OperationCancelled, ParsedSegment, TextChunk
 from sensor_vector_db.utils.file_utils import (
     detect_file_type,
     get_file_info,
@@ -22,6 +22,7 @@ from sensor_vector_db.utils.logger import get_logger
 
 
 logger = get_logger(__name__)
+CancelCallback = Callable[[], None]
 
 
 class BaseDocumentParser(ABC):
@@ -32,7 +33,11 @@ class BaseDocumentParser(ABC):
         self.settings = settings or get_settings()
 
     @abstractmethod
-    def parse(self, path: str | Path) -> list[ParsedSegment]:
+    def parse(
+        self,
+        path: str | Path,
+        cancel_callback: CancelCallback | None = None,
+    ) -> list[ParsedSegment]:
         """Parse a source file into source-preserving segments."""
 
 
@@ -121,8 +126,13 @@ class PDFParser(BaseDocumentParser):
         super().__init__(settings)
         self.ocr_client = OCRClient(self.settings)
 
-    def parse(self, path: str | Path) -> list[ParsedSegment]:
+    def parse(
+        self,
+        path: str | Path,
+        cancel_callback: CancelCallback | None = None,
+    ) -> list[ParsedSegment]:
         """Parse PDF pages into text, table, and OCR segments."""
+        _check_cancelled(cancel_callback)
         file_path = Path(path)
         segments: list[ParsedSegment] = []
         try:
@@ -132,57 +142,87 @@ class PDFParser(BaseDocumentParser):
 
         try:
             with pdfplumber.open(file_path) as pdf:
-                for page_number, page in enumerate(pdf.pages, start=1):
-                    text = page.extract_text() or ""
-                    if text.strip():
-                        segments.append(
-                            ParsedSegment(
-                                content=text.strip(),
-                                content_type="text",
-                                page_number=page_number,
-                            )
-                        )
-
-                    for table in page.extract_tables() or []:
-                        table_text = _table_to_markdown(table)
-                        if table_text.strip():
+                pdfium_document: Any | None = None
+                ocr_pages_used = 0
+                try:
+                    for page_number, page in enumerate(pdf.pages, start=1):
+                        _check_cancelled(cancel_callback)
+                        text = page.extract_text() or ""
+                        if text.strip():
                             segments.append(
                                 ParsedSegment(
-                                    content=table_text,
-                                    content_type="table",
+                                    content=text.strip(),
+                                    content_type="text",
                                     page_number=page_number,
                                 )
                             )
 
-                    if self._should_ocr_page(text):
-                        ocr_text = self._ocr_pdf_page(file_path, page_number - 1)
-                        if ocr_text.strip():
-                            segments.append(
-                                ParsedSegment(
-                                    content=ocr_text.strip(),
-                                    content_type="ocr",
-                                    page_number=page_number,
+                        for table in page.extract_tables() or []:
+                            table_text = _table_to_markdown(table)
+                            if table_text.strip():
+                                segments.append(
+                                    ParsedSegment(
+                                        content=table_text,
+                                        content_type="table",
+                                        page_number=page_number,
+                                    )
                                 )
-                            )
+
+                        if self._should_ocr_page(text, ocr_pages_used):
+                            _check_cancelled(cancel_callback)
+                            if pdfium_document is None:
+                                pdfium_document = self._open_pdfium_document(file_path)
+                            ocr_pages_used += 1
+                            ocr_text = self._ocr_pdf_page(pdfium_document, file_path, page_number - 1)
+                            _check_cancelled(cancel_callback)
+                            if ocr_text.strip():
+                                segments.append(
+                                    ParsedSegment(
+                                        content=ocr_text.strip(),
+                                        content_type="ocr",
+                                        page_number=page_number,
+                                    )
+                                )
+                finally:
+                    self._close_pdfium_document(pdfium_document)
             return segments
+        except OperationCancelled:
+            raise
         except Exception as exc:
             raise RuntimeError(f"Failed to parse PDF {file_path}: {exc}") from exc
 
-    def _should_ocr_page(self, text: str) -> bool:
+    def _should_ocr_page(self, text: str, ocr_pages_used: int = 0) -> bool:
         """Return whether a PDF page should be sent to OCR."""
-        return self.settings.ocr_enabled and len(text.strip()) < self.settings.ocr_min_text_chars
+        if not self.settings.ocr_enabled:
+            return False
+        if len(text.strip()) >= self.settings.ocr_min_text_chars:
+            return False
+        max_pages = self.settings.ocr_max_pages_per_file
+        return max_pages <= 0 or ocr_pages_used < max_pages
 
-    def _ocr_pdf_page(self, path: Path, page_index: int) -> str:
-        """Render a PDF page to a temporary image and run OCR."""
+    @staticmethod
+    def _open_pdfium_document(path: Path) -> Any:
+        """Open a PDF with pypdfium2 for OCR rendering."""
         try:
             import pypdfium2 as pdfium
         except ImportError as exc:
             raise RuntimeError("pypdfium2 is required for PDF OCR rendering.") from exc
+        return pdfium.PdfDocument(str(path))
 
+    @staticmethod
+    def _close_pdfium_document(pdfium_document: Any | None) -> None:
+        """Close a pypdfium2 document when the runtime exposes a close method."""
+        if pdfium_document is None:
+            return
+        close = getattr(pdfium_document, "close", None)
+        if callable(close):
+            close()
+
+    def _ocr_pdf_page(self, pdfium_document: Any, path: Path, page_index: int) -> str:
+        """Render a PDF page to a temporary image and run OCR."""
         try:
-            pdf = pdfium.PdfDocument(str(path))
-            page = pdf[page_index]
-            bitmap = page.render(scale=2.0)
+            page = pdfium_document[page_index]
+            bitmap = page.render(scale=self.settings.ocr_render_scale)
             pil_image = bitmap.to_pil()
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
                 temp_path = Path(temp_file.name)
@@ -199,8 +239,13 @@ class PDFParser(BaseDocumentParser):
 class WordParser(BaseDocumentParser):
     """Parse DOCX paragraphs and tables."""
 
-    def parse(self, path: str | Path) -> list[ParsedSegment]:
+    def parse(
+        self,
+        path: str | Path,
+        cancel_callback: CancelCallback | None = None,
+    ) -> list[ParsedSegment]:
         """Parse a DOCX document."""
+        _check_cancelled(cancel_callback)
         file_path = Path(path)
         try:
             from docx import Document as DocxDocument
@@ -218,11 +263,14 @@ class WordParser(BaseDocumentParser):
             if paragraph_text:
                 segments.append(ParsedSegment(paragraph_text, "text"))
             for table in document.tables:
+                _check_cancelled(cancel_callback)
                 rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
                 table_text = _table_to_markdown(rows)
                 if table_text.strip():
                     segments.append(ParsedSegment(table_text, "table"))
             return segments
+        except OperationCancelled:
+            raise
         except Exception as exc:
             raise RuntimeError(f"Failed to parse DOCX {file_path}: {exc}") from exc
 
@@ -230,8 +278,13 @@ class WordParser(BaseDocumentParser):
 class TextParser(BaseDocumentParser):
     """Parse plain text-like files."""
 
-    def parse(self, path: str | Path) -> list[ParsedSegment]:
+    def parse(
+        self,
+        path: str | Path,
+        cancel_callback: CancelCallback | None = None,
+    ) -> list[ParsedSegment]:
         """Read a text file as one segment."""
+        _check_cancelled(cancel_callback)
         content = read_text_with_fallback(path)
         return [ParsedSegment(content=content, content_type="text")]
 
@@ -239,8 +292,13 @@ class TextParser(BaseDocumentParser):
 class CodeParser(BaseDocumentParser):
     """Parse source code files while preserving syntax units where possible."""
 
-    def parse(self, path: str | Path) -> list[ParsedSegment]:
+    def parse(
+        self,
+        path: str | Path,
+        cancel_callback: CancelCallback | None = None,
+    ) -> list[ParsedSegment]:
         """Parse code by AST for Python or conservative line chunks otherwise."""
+        _check_cancelled(cancel_callback)
         file_path = Path(path)
         content = read_text_with_fallback(file_path)
         if file_path.suffix.lower() == ".py":
@@ -280,23 +338,34 @@ class DocumentParserFactory:
     def __init__(self, settings: Settings | None = None) -> None:
         """Initialize factory."""
         self.settings = settings or get_settings()
+        self._parsers: dict[str, BaseDocumentParser] = {}
 
     def get_parser(self, path: str | Path) -> BaseDocumentParser:
         """Return a parser for the file type."""
         file_type = detect_file_type(path)
+        parser = self._parsers.get(file_type)
+        if parser:
+            return parser
         if file_type == "pdf":
-            return PDFParser(self.settings)
-        if file_type == "docx":
-            return WordParser(self.settings)
-        if file_type == "text":
-            return TextParser(self.settings)
-        if file_type == "code":
-            return CodeParser(self.settings)
-        raise ValueError(f"Unsupported file type for {path}")
+            parser = PDFParser(self.settings)
+        elif file_type == "docx":
+            parser = WordParser(self.settings)
+        elif file_type == "text":
+            parser = TextParser(self.settings)
+        elif file_type == "code":
+            parser = CodeParser(self.settings)
+        else:
+            raise ValueError(f"Unsupported file type for {path}")
+        self._parsers[file_type] = parser
+        return parser
 
-    def parse(self, path: str | Path) -> list[ParsedSegment]:
+    def parse(
+        self,
+        path: str | Path,
+        cancel_callback: CancelCallback | None = None,
+    ) -> list[ParsedSegment]:
         """Parse a supported file."""
-        return self.get_parser(path).parse(path)
+        return self.get_parser(path).parse(path, cancel_callback=cancel_callback)
 
 
 class DocumentChunker:
@@ -376,6 +445,20 @@ class MetadataExtractor:
         r"(?:型号|产品型号|Model|Part\s*Number|P/N)\s*[:：]\s*([A-Za-z0-9_\-./]+)",
         r"\b([A-Z]{1,6}[-_]?\d{2,6}[A-Z0-9\-_.]*)\b",
     )
+    # Explicit "型号: XXX" / "Model: XXX" labels are high-confidence evidence.
+    MODEL_LABEL_PATTERNS = (MODEL_PATTERNS[0],)
+    # Label-free fallback: an alphanumeric designator such as LDR-100 or VLP-16.
+    MODEL_FALLBACK_PATTERN = MODEL_PATTERNS[1]
+    # Common standards, interfaces, and protocols the fallback must not mistake
+    # for a sensor model (for example ISO9001, RS232, IP67, GB2312, USB3).
+    NON_MODEL_PREFIXES = frozenset(
+        {
+            "iso", "iec", "ieee", "ansi", "din", "jis", "gb", "gbt", "en",
+            "ul", "ce", "fcc", "rohs", "reach", "mil", "nema",
+            "rs", "ip", "usb", "hdmi", "vga", "tcp", "udp", "i2c", "spi",
+            "can", "uart", "pwm", "adc", "dac", "led", "lcd", "pcb",
+        }
+    )
 
     def extract(
         self,
@@ -397,9 +480,39 @@ class MetadataExtractor:
             "tags": ",".join(tags or []),
             "notes": notes,
             "manufacturer": first_regex_group(text, self.MANUFACTURER_PATTERNS),
-            "sensor_model": first_regex_group(text, self.MODEL_PATTERNS),
+            "sensor_model": self._extract_model(text),
         }
         return metadata
+
+    def extract_hints_from_text(self, text: str) -> dict[str, str | None]:
+        """Derive sensor model and manufacturer hints from text evidence only.
+
+        Shared by import-time extraction and the metadata refresh tool so both
+        paths apply identical rules without re-parsing the source file.
+        """
+        return {
+            "manufacturer": first_regex_group(text, self.MANUFACTURER_PATTERNS),
+            "sensor_model": self._extract_model(text),
+        }
+
+    def _extract_model(self, text: str) -> str | None:
+        """Return the most reliable sensor model evidence from text.
+
+        Explicit ``型号:``/``Model:`` labels take priority. Otherwise the
+        label-free fallback returns the first alphanumeric designator whose
+        alphabetic prefix is not a known standard, interface, or protocol, so
+        tokens like ISO9001, RS232, IP67 or USB3 are never treated as models.
+        """
+        labelled = first_regex_group(text, self.MODEL_LABEL_PATTERNS)
+        if labelled:
+            return labelled
+        for match in re.finditer(self.MODEL_FALLBACK_PATTERN, text):
+            candidate = match.group(1).strip(" ;,，。")
+            prefix = re.match(r"[A-Za-z]+", candidate)
+            if prefix and prefix.group(0).lower() in self.NON_MODEL_PREFIXES:
+                continue
+            return candidate
+        return None
 
 
 def _table_to_markdown(table: list[list[Any]]) -> str:
@@ -415,6 +528,12 @@ def _table_to_markdown(table: list[list[Any]]) -> str:
     body = rows[1:]
     markdown_rows = [header, separator, *body]
     return "\n".join("| " + " | ".join(row) + " |" for row in markdown_rows)
+
+
+def _check_cancelled(cancel_callback: CancelCallback | None) -> None:
+    """Run an optional cancellation checkpoint."""
+    if cancel_callback:
+        cancel_callback()
 
 
 def tokenize_for_chunking(text: str) -> list[str]:

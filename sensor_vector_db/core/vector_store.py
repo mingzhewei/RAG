@@ -50,6 +50,22 @@ class VectorStore:
         except Exception as exc:
             raise RuntimeError(f"Failed to upsert chunks into ChromaDB: {exc}") from exc
 
+    def update_metadata(
+        self,
+        chunk_ids: list[str],
+        metadatas: list[dict[str, Any]],
+    ) -> None:
+        """Update chunk metadata in place without recomputing embeddings."""
+        if not chunk_ids:
+            return
+        try:
+            self.collection.update(
+                ids=chunk_ids,
+                metadatas=[_clean_metadata(item) for item in metadatas],
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Failed to update chunk metadata in ChromaDB: {exc}") from exc
+
     def get_embeddings(self, chunk_ids: list[str]) -> dict[str, list[float]]:
         """Return stored embeddings keyed by chunk ID."""
         if not chunk_ids:
@@ -76,7 +92,7 @@ class VectorStore:
     ) -> list[SearchResult]:
         """Run semantic search in ChromaDB."""
         try:
-            where = _clean_metadata(filters or {}) or None
+            where = _build_where_clause(filters)
             result = self.collection.query(
                 query_embeddings=[query_embedding],
                 n_results=top_k,
@@ -132,6 +148,22 @@ class VectorStore:
                 )
             )
         return search_results
+
+
+def _build_where_clause(filters: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Build a ChromaDB-compatible where clause from scalar metadata filters.
+
+    ChromaDB requires the top-level ``where`` mapping to contain exactly one
+    operator, so multiple equality conditions must be combined explicitly with
+    ``$and``. A single condition is passed through unchanged, and empty filters
+    return ``None``.
+    """
+    cleaned = _clean_metadata(filters or {})
+    if not cleaned:
+        return None
+    if len(cleaned) == 1:
+        return cleaned
+    return {"$and": [{key: value} for key, value in cleaned.items()]}
 
 
 def _clean_metadata(metadata: dict[str, Any]) -> dict[str, str | int | float | bool]:
