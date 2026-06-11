@@ -35,11 +35,17 @@ def configure_logging(settings: Settings, level: str = "INFO") -> None:
 
         root.addHandler(console)
         root.addHandler(file_handler)
+        _configure_third_party_logging()
     except OSError as exc:
         raise RuntimeError(f"Failed to configure logging: {exc}") from exc
+
+
+def _configure_third_party_logging() -> None:
+    """Reduce noisy third-party parser logs that are not actionable for users."""
+    logging.getLogger("pdfminer").setLevel(logging.ERROR)
+    logging.getLogger("pdfminer.pdffont").setLevel(logging.ERROR)
 
 
 def get_logger(name: str) -> logging.Logger:
     """Return a named logger."""
     return logging.getLogger(name)
-

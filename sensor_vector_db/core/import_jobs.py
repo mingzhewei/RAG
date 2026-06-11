@@ -10,10 +10,12 @@ from pathlib import Path
 import threading
 from typing import Any
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 
 from sensor_vector_db.config.settings import Settings, get_settings
 from sensor_vector_db.core.document_manager import DocumentManager
+from sensor_vector_db.core.index_profile import build_index_profile, profile_satisfies
+from sensor_vector_db.core.types import OperationCancelled
 from sensor_vector_db.models.database import (
     Document,
     ImportJob,
@@ -35,7 +37,7 @@ _THREAD_LOCK = threading.Lock()
 RETRYABLE_FILE_STATUSES = {"pending", "processing", "failed"}
 
 
-class ImportCancelled(RuntimeError):
+class ImportCancelled(OperationCancelled):
     """Raised when an import job has been asked to stop."""
 
 
@@ -67,7 +69,20 @@ class ImportJobSnapshot:
         """Return progress as 0-1 ratio."""
         if self.total_files <= 0:
             return 0.0
-        return min(1.0, max(0.0, self.current_index / self.total_files))
+        return min(1.0, max(0.0, self.completed_files / self.total_files))
+
+    @property
+    def completed_files(self) -> int:
+        """Return files that reached a final file-level state."""
+        return min(
+            self.total_files,
+            max(0, self.imported + self.updated + self.skipped + self.failed),
+        )
+
+    @property
+    def pending_files(self) -> int:
+        """Return files not yet in a final file-level state."""
+        return max(0, self.total_files - self.completed_files)
 
     @property
     def can_resume(self) -> bool:
@@ -88,6 +103,7 @@ class ImportJobManager:
         """Initialize manager."""
         self.settings = settings or get_settings()
         init_database(self.settings)
+        self._recover_orphaned_running_jobs()
 
     def start_import(self, source_path: str | Path) -> str:
         """Create a directory sync job and start it in a background thread."""
@@ -147,6 +163,51 @@ class ImportJobManager:
         """Ask all running import jobs to stop at the next safe checkpoint."""
         request_stop_all_running_jobs()
 
+    def _recover_orphaned_running_jobs(self) -> None:
+        """Mark persisted running jobs without a live worker as resumable."""
+        with _THREAD_LOCK:
+            active_job_ids = {
+                job_id
+                for job_id, thread in _RUNNING_THREADS.items()
+                if thread.is_alive()
+            }
+
+        with session_scope(self.settings) as session:
+            jobs = session.execute(
+                select(ImportJob).where(ImportJob.status == "running")
+            ).scalars().all()
+            for job in jobs:
+                if job.id in active_job_ids:
+                    continue
+                now = utc_now()
+                job.status = "interrupted"
+                job.phase = "上次运行已中断"
+                job.message = "检测到后台导入线程已不存在；任务已标记为可恢复，未完成文件会重新排队。"
+                job.finished_at = now
+                job.updated_at = now
+
+                for row in session.execute(
+                    select(ImportJobFile).where(
+                        ImportJobFile.job_id == job.id,
+                        ImportJobFile.status == "processing",
+                    )
+                ).scalars():
+                    row.status = "pending"
+                    row.phase = "恢复排队"
+                    row.message = "上次运行退出时正在处理该文件，已放回待处理队列"
+                    row.error_message = None
+                    row.updated_at = now
+
+                session.add(
+                    ImportJobEvent(
+                        job_id=job.id,
+                        level="warning",
+                        phase="上次运行已中断",
+                        message="启动时发现 running 任务没有对应后台线程，已转为 interrupted，可手动恢复。",
+                        file_path=job.current_file,
+                    )
+                )
+
     def list_jobs(self, limit: int = 20) -> list[ImportJobSnapshot]:
         """Return recent import jobs."""
         with session_scope(self.settings) as session:
@@ -180,6 +241,16 @@ class ImportJobManager:
                 }
                 for event in reversed(events)
             ]
+
+    def get_file_status_counts(self, job_id: str) -> dict[str, int]:
+        """Return exact per-file status counts for a job."""
+        with session_scope(self.settings) as session:
+            rows = session.execute(
+                select(ImportJobFile.status, func.count())
+                .where(ImportJobFile.job_id == job_id)
+                .group_by(ImportJobFile.status)
+            ).all()
+            return {str(status): int(count) for status, count in rows}
 
     def get_file_rows(self, job_id: str, limit: int = 500) -> list[dict[str, Any]]:
         """Return per-file status rows for the UI."""
@@ -329,6 +400,7 @@ class ImportJobManager:
             status = manager.import_file(
                 file_path,
                 progress_callback=progress,
+                cancel_callback=lambda: self._raise_if_cancelled(stop_event),
                 current_index=sequence,
                 total_files=total_pending,
             )
@@ -353,6 +425,7 @@ class ImportJobManager:
         try:
             file_hash = calculate_file_md5(file_path)
             info = get_file_info(file_path)
+            target_profile = build_index_profile(self.settings)
         except Exception as exc:
             self._upsert_error_file(job_id, resolved, exc)
             return
@@ -361,12 +434,19 @@ class ImportJobManager:
             existing_doc = session.execute(
                 select(Document).where(Document.file_path == resolved)
             ).scalar_one_or_none()
-            reusable_doc = session.execute(
+            reusable_candidates = session.execute(
                 select(Document)
-                .where(Document.file_hash == file_hash)
+                .where(Document.file_hash == file_hash, Document.status == "imported")
                 .order_by(Document.imported_at)
-                .limit(1)
-            ).scalar_one_or_none()
+            ).scalars().all()
+            reusable_doc = next(
+                (
+                    document
+                    for document in reusable_candidates
+                    if profile_satisfies(document.index_profile, target_profile)
+                ),
+                None,
+            )
             row = session.execute(
                 select(ImportJobFile).where(
                     ImportJobFile.job_id == job_id,
@@ -382,10 +462,15 @@ class ImportJobManager:
             row.modified_at = info.modified_at
             row.updated_at = utc_now()
 
-            if existing_doc and existing_doc.file_hash == file_hash:
+            if (
+                existing_doc
+                and existing_doc.file_hash == file_hash
+                and existing_doc.status == "imported"
+                and profile_satisfies(existing_doc.index_profile, target_profile)
+            ):
                 row.status = "skipped"
                 row.phase = "已存在"
-                row.message = "文件未变化，已有向量，跳过"
+                row.message = "文件未变化，且索引配置已满足目标，跳过"
                 row.document_id = existing_doc.id
                 row.error_message = None
                 row.finished_at = utc_now()
@@ -395,6 +480,14 @@ class ImportJobManager:
                     row.phase = "等待复用"
                     row.message = "文件哈希已入库，等待复用已有向量"
                     row.document_id = existing_doc.id if existing_doc else reusable_doc.id
+                elif existing_doc and existing_doc.file_hash == file_hash:
+                    row.phase = "等待重建"
+                    row.message = "文件未变化，但索引配置未满足目标，等待重建向量"
+                    row.document_id = existing_doc.id
+                elif existing_doc and existing_doc.status != "imported":
+                    row.phase = "等待重建"
+                    row.message = "上次索引未完整完成，等待重建向量"
+                    row.document_id = existing_doc.id
                 else:
                     row.phase = "等待处理"
                     row.message = "新增文件" if not existing_doc else "文件已修改，等待更新向量"

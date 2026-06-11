@@ -130,6 +130,7 @@ class SearchEngine:
     def _load_candidate_chunks(self, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Load chunks from SQLite for BM25 indexing."""
         clauses = []
+        clauses.append(Document.status == "imported")
         if filters:
             if filters.get("file_type"):
                 clauses.append(Document.file_type == filters["file_type"])
@@ -217,4 +218,3 @@ def _metadata_filters(filters: dict[str, Any] | None) -> dict[str, Any]:
         for key, value in filters.items()
         if key in {"file_type", "manufacturer", "sensor_model"} and value
     }
-

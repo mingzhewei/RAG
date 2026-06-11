@@ -5,6 +5,10 @@ from pathlib import Path
 from typing import Any
 
 
+class OperationCancelled(RuntimeError):
+    """Raised when a long-running operation is asked to stop."""
+
+
 @dataclass
 class ParsedSegment:
     """Parsed logical segment from a source document."""
@@ -61,4 +65,3 @@ class ImportReport:
     skipped: int = 0
     failed: int = 0
     errors: list[ImportErrorItem] = field(default_factory=list)
-

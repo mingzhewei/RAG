@@ -57,6 +57,7 @@ class Document(Base):
     tags: Mapped[str | None] = mapped_column(Text, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    index_profile: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     chunks: Mapped[list["DocumentChunk"]] = relationship(
         back_populates="document",
@@ -248,12 +249,17 @@ def session_scope(settings: Settings | None = None) -> Iterator[Session]:
 def _ensure_sqlite_columns(engine) -> None:
     """Add newly introduced SQLite columns for existing local databases."""
     inspector = inspect(engine)
-    if "import_jobs" not in inspector.get_table_names():
+    table_names = inspector.get_table_names()
+    if "import_jobs" not in table_names:
         return
-    columns = {column["name"] for column in inspector.get_columns("import_jobs")}
     statements = []
-    if "deleted" not in columns:
+    import_job_columns = {column["name"] for column in inspector.get_columns("import_jobs")}
+    if "deleted" not in import_job_columns:
         statements.append("ALTER TABLE import_jobs ADD COLUMN deleted INTEGER DEFAULT 0")
+    if "documents" in table_names:
+        document_columns = {column["name"] for column in inspector.get_columns("documents")}
+        if "index_profile" not in document_columns:
+            statements.append("ALTER TABLE documents ADD COLUMN index_profile TEXT")
     with engine.begin() as connection:
         for statement in statements:
             connection.execute(text(statement))

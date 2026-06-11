@@ -8,7 +8,18 @@
 .\.venv\Scripts\python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 .\.venv\Scripts\python main.py
-.\.venv\Scripts\streamlit run ui\app.py
+```
+
+`main.py` 会初始化本地 SQLite/Chroma 目录并自动启动 Streamlit 界面。只检查环境、不启动界面时使用：
+
+```powershell
+.\.venv\Scripts\python main.py --check
+```
+
+如果默认端口被占用，可以指定端口：
+
+```powershell
+.\.venv\Scripts\python main.py --port 8502
 ```
 
 `DEEPSEEK_API_KEY` 只写入 `.env` 或在 Streamlit 系统管理页临时输入，不要提交到 Git。
@@ -34,6 +45,18 @@ Copy-Item .env.example .env
 - 源目录中删除的文件会在下一次同步时清理对应 SQLite 元数据和 Chroma 向量。
 - 如果关机或服务重启导致任务中断，回到文档导入页选择任务并点击“恢复该任务”即可继续处理未完成或失败文件。
 - 文件级明细会显示成功、跳过、失败、当前阶段和错误原因。
+
+## 导入加速
+
+- 默认先不做 OCR：`OCR_ENABLED=false`。PDF 会先尽量抽取可复制文本、表格并完成向量化。
+- 文字版资料入库完成后，可以把 `.env` 改成 `OCR_ENABLED=true` 再恢复导入；程序会识别 text-only 索引无法满足 OCR 目标，并重建需要 OCR 的文件。
+- 重建时会先写入临时 `indexing` 状态，只有 SQLite 元数据和 Chroma 向量都写成功后才标记为 `imported`，避免半成品污染检索。
+- 默认每个 PDF 最多 OCR 20 页，防止长扫描件拖垮内存和磁盘；`OCR_MAX_PAGES_PER_FILE=0` 表示不限制。
+- `OCR_RENDER_SCALE=1.5` 会降低 OCR 渲染图片尺寸，通常比 `2.0` 更省内存和 SSD 写入。
+- BGE embedding 在 CPU 上会很慢。有可用 NVIDIA GPU 时，可尝试 `EMBEDDING_DEVICE=cuda` 和 `EMBEDDING_USE_FP16=true`。
+- `EMBEDDING_BATCH_SIZE` 调大可能更快，但会增加内存压力；机器已经卡顿时不要盲目调大。
+- `CHUNK_SIZE` 调大可以减少向量数量、加快导入，但检索粒度会变粗。
+- 默认 `NATIVE_THREAD_LIMIT=4`，限制 Paddle/torch/numpy 这类底层库吃满 CPU；`0` 表示不限制。
 
 ## 主要目录
 

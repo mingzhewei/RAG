@@ -1,6 +1,7 @@
 """Application settings loaded from environment variables and .env."""
 
 from functools import lru_cache
+import os
 from pathlib import Path
 
 from pydantic import Field, field_validator
@@ -29,9 +30,11 @@ class Settings(BaseSettings):
     embedding_use_fp16: bool = Field(default=False)
     embedding_dimension: int = Field(default=1024)
 
-    ocr_enabled: bool = Field(default=True)
+    ocr_enabled: bool = Field(default=False)
     ocr_lang: str = Field(default="ch")
     ocr_min_text_chars: int = Field(default=80)
+    ocr_max_pages_per_file: int = Field(default=20)
+    ocr_render_scale: float = Field(default=1.5)
 
     chroma_path: Path = Field(default=Path("data/chroma"))
     chroma_collection: str = Field(default="sensor_documents")
@@ -43,6 +46,7 @@ class Settings(BaseSettings):
     search_top_k: int = Field(default=8)
     semantic_weight: float = Field(default=0.65)
     bm25_weight: float = Field(default=0.35)
+    native_thread_limit: int = Field(default=4)
 
     code_extensions: tuple[str, ...] = Field(
         default=(
@@ -77,6 +81,30 @@ class Settings(BaseSettings):
             raise ValueError("Search weights must be non-negative.")
         return value
 
+    @field_validator("ocr_render_scale")
+    @classmethod
+    def _validate_positive_float(cls, value: float) -> float:
+        """Validate positive floating-point runtime settings."""
+        if value <= 0:
+            raise ValueError("Numeric runtime settings must be positive.")
+        return value
+
+    @field_validator("embedding_batch_size")
+    @classmethod
+    def _validate_positive_integer(cls, value: int) -> int:
+        """Validate positive numeric runtime settings."""
+        if value < 1:
+            raise ValueError("Numeric runtime settings must be positive.")
+        return value
+
+    @field_validator("ocr_min_text_chars", "ocr_max_pages_per_file", "native_thread_limit")
+    @classmethod
+    def _validate_non_negative_integer(cls, value: int) -> int:
+        """Validate non-negative numeric runtime settings."""
+        if value < 0:
+            raise ValueError("Numeric runtime settings must be non-negative.")
+        return value
+
     def ensure_directories(self) -> None:
         """Create data and log directories required by the application."""
         try:
@@ -86,11 +114,27 @@ class Settings(BaseSettings):
         except OSError as exc:
             raise RuntimeError(f"Failed to create runtime directories: {exc}") from exc
 
+    def apply_resource_limits(self) -> None:
+        """Apply conservative native-library thread limits unless already configured."""
+        if self.native_thread_limit <= 0:
+            return
+        thread_count = str(self.native_thread_limit)
+        for key in (
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+            "TORCH_NUM_THREADS",
+            "PADDLE_NUM_THREADS",
+        ):
+            os.environ.setdefault(key, thread_count)
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Return cached application settings."""
     settings = Settings()
     settings.ensure_directories()
+    settings.apply_resource_limits()
     return settings
-

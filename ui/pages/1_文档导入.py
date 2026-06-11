@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from bootstrap import configure_page, get_document_manager, get_import_job_manager
-from components.document_card import render_document
 
 import pandas as pd
 import streamlit as st
@@ -19,10 +18,9 @@ job_manager = get_import_job_manager()
 
 default_path = st.session_state.get("import_path", str(Path("sensor").resolve()))
 path = st.text_input("本地文件或文件夹路径", value=default_path, key="import_path")
-cols = st.columns([0.22, 0.18, 0.6])
+cols = st.columns([0.22, 0.78])
 start = cols[0].button("开始/继续同步", type="primary", disabled=not bool(path.strip()))
-manual_refresh = cols[1].button("刷新状态")
-cols[2].caption("同步会识别新增、修改、未变化和已删除文件；任务状态持久保存，重启后可继续。")
+cols[1].caption("同步会识别新增、修改、未变化和已删除文件；任务状态持久保存，重启后可继续。")
 
 if start:
     job_id = job_manager.start_import(path.strip())
@@ -49,26 +47,51 @@ if jobs:
 else:
     job = None
 
-if job:
-    if job.status == "running" and job.is_thread_active:
-        st.markdown("<meta http-equiv='refresh' content='5'>", unsafe_allow_html=True)
 
+def _status_summary_text(status_counts: dict[str, int]) -> str:
+    """Build a compact status count summary for the file table."""
+    if not status_counts:
+        return "暂无文件状态"
+    return "，".join(f"{status}={count}" for status, count in sorted(status_counts.items()))
+
+
+def _render_import_job(job_id: str) -> None:
+    """Render one import job with fresh status loaded from SQLite."""
+    job = job_manager.get_job(job_id)
+    if not job:
+        st.info("任务不存在或已被删除。")
+        return
     st.subheader("任务状态")
-    status_cols = st.columns(6)
+    status_counts = job_manager.get_file_status_counts(job.id)
+    processing_count = status_counts.get("processing", 0)
+    pending_count = status_counts.get("pending", 0)
+    waiting_count = pending_count + processing_count
+    vectorized_count = job.imported + job.updated
+    completed_count = job.completed_files
+
+    status_cols = st.columns(4)
     status_cols[0].metric("状态", job.status)
-    status_cols[1].metric("阶段", job.phase)
-    status_cols[2].metric("文件", f"{job.current_index}/{job.total_files}")
-    status_cols[3].metric("新增", job.imported)
-    status_cols[4].metric("更新", job.updated)
-    status_cols[5].metric("失败", job.failed)
-    more_cols = st.columns(3)
-    more_cols[0].metric("跳过", job.skipped)
-    more_cols[1].metric("删除清理", job.deleted)
-    more_cols[2].metric("后台线程", "运行中" if job.is_thread_active else "未运行")
+    status_cols[1].metric("总文件", job.total_files)
+    status_cols[2].metric("已完成", f"{completed_count}/{job.total_files}")
+    status_cols[3].metric("待处理", waiting_count)
+    detail_cols = st.columns(4)
+    detail_cols[0].metric("阶段", job.phase)
+    detail_cols[1].metric("新向量化", vectorized_count)
+    detail_cols[2].metric("复用/跳过", job.skipped)
+    detail_cols[3].metric("失败", job.failed)
+    extra_cols = st.columns(4)
+    extra_cols[0].metric("正在处理", processing_count)
+    extra_cols[1].metric("删除清理", job.deleted)
+    extra_cols[2].metric("计划序号", f"{job.current_index}/{job.total_files}")
+    extra_cols[3].metric("后台线程", "运行中" if job.is_thread_active else "未运行")
     st.progress(job.progress_ratio)
     st.write(job.message or "")
     if job.current_file:
         st.caption(f"当前文件：{job.current_file}")
+    st.caption(
+        "总文件表示本次目录中识别到的支持文件；已完成包含新增、更新、复用/跳过和失败；"
+        "计划序号用于观察扫描/排队阶段，不等同于已向量化数量。状态区域会局部更新，不刷新整个浏览器页面。"
+    )
 
     action_cols = st.columns([0.18, 0.18, 0.64])
     if action_cols[0].button("恢复该任务", disabled=not job.can_resume):
@@ -86,13 +109,14 @@ if job:
     st.subheader("最近事件")
     events = job_manager.get_events(job.id, limit=120)
     if events:
-        st.dataframe(pd.DataFrame(events), width="stretch", hide_index=True)
+        st.dataframe(pd.DataFrame(events), width="stretch", hide_index=True, height=260)
     else:
         st.info("暂无事件。")
 
     st.subheader("文件明细")
     file_rows = job_manager.get_file_rows(job.id, limit=1000)
     if file_rows:
+        st.caption(f"当前显示 {len(file_rows)} 条文件记录；状态统计：{_status_summary_text(status_counts)}")
         status_filter = st.multiselect(
             "状态过滤",
             sorted({row["status"] for row in file_rows}),
@@ -101,13 +125,42 @@ if job:
         filtered = [
             row for row in file_rows if not status_filter or row["status"] in status_filter
         ]
-        st.dataframe(pd.DataFrame(filtered), width="stretch", hide_index=True)
+        st.dataframe(pd.DataFrame(filtered), width="stretch", hide_index=True, height=320)
     else:
         st.info("任务尚未生成文件计划。")
-elif manual_refresh:
+
+
+@st.fragment(run_every="5s")
+def _render_import_job_live(job_id: str) -> None:
+    """Poll import status without a browser-level page refresh."""
+    _render_import_job(job_id)
+
+
+@st.fragment(run_every="15s")
+def _render_imported_documents() -> None:
+    """Render imported documents and refresh the table locally."""
+    st.subheader("已入库文档")
+    documents = get_document_manager().list_documents()
+    if not documents:
+        st.info("尚未导入文档。")
+        return
+    rows = [
+        {
+            "文件名": document["filename"],
+            "类型": document["file_type"],
+            "型号": document.get("sensor_model") or "",
+            "厂商": document.get("manufacturer") or "",
+            "状态": document["status"],
+            "路径": document["file_path"],
+        }
+        for document in documents
+    ]
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, height=320)
+
+
+if job:
+    _render_import_job_live(job.id)
+else:
     st.info("暂无导入任务。")
 
-st.subheader("已入库文档")
-manager = get_document_manager()
-for document in manager.list_documents():
-    render_document(document)
+_render_imported_documents()

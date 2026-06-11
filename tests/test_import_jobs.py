@@ -6,6 +6,7 @@ import time
 from sensor_vector_db.core import import_jobs as import_jobs_module
 from sensor_vector_db.core.import_jobs import ImportJobManager, classify_error
 from sensor_vector_db.core.document_manager import DocumentManager
+from sensor_vector_db.models.database import ImportJob, ImportJobFile, session_scope
 
 
 def wait_for_job(manager: ImportJobManager, job_id: str, timeout: float = 20.0):
@@ -91,8 +92,17 @@ def test_import_job_can_be_interrupted(test_settings, tmp_path: Path, monkeypatc
         def delete_document(self, document_id: str) -> None:
             return None
 
-        def import_file(self, file_path, progress_callback=None, current_index=1, total_files=1):
+        def import_file(
+            self,
+            file_path,
+            progress_callback=None,
+            cancel_callback=None,
+            current_index=1,
+            total_files=1,
+        ):
             while True:
+                if cancel_callback:
+                    cancel_callback()
                 if progress_callback:
                     progress_callback(
                         current_index,
@@ -117,6 +127,47 @@ def test_import_job_can_be_interrupted(test_settings, tmp_path: Path, monkeypatc
     interrupted = wait_for_job(manager, job_id)
     assert interrupted.status == "interrupted"
     assert interrupted.can_resume
+
+
+def test_manager_recovers_orphaned_running_job(test_settings, tmp_path: Path) -> None:
+    """A persisted running job without a live worker should become resumable."""
+    source_dir = tmp_path / "sensor"
+    source_dir.mkdir()
+    source_file = source_dir / "sensor.txt"
+    source_file.write_text("Model: LDR-100\nRange: 100 m", encoding="utf-8")
+
+    with session_scope(test_settings) as session:
+        job = ImportJob(
+            source_path=str(source_dir.resolve()),
+            status="running",
+            phase="解析文档",
+            message="正在解析正文、表格或 OCR 文本",
+            current_file=str(source_file.resolve()),
+            total_files=1,
+        )
+        session.add(job)
+        session.flush()
+        job_id = job.id
+        session.add(
+            ImportJobFile(
+                job_id=job_id,
+                file_path=str(source_file.resolve()),
+                status="processing",
+                phase="解析文档",
+                message="正在解析正文、表格或 OCR 文本",
+            )
+        )
+
+    manager = ImportJobManager(test_settings)
+    recovered = manager.get_job(job_id)
+    assert recovered is not None
+    assert recovered.status == "interrupted"
+    assert recovered.can_resume
+
+    rows = manager.get_file_rows(job_id)
+    assert rows[0]["status"] == "pending"
+    assert rows[0]["phase"] == "恢复排队"
+    assert any(event["phase"] == "上次运行已中断" for event in manager.get_events(job_id))
 
 
 def test_error_classification_for_user_messages() -> None:
