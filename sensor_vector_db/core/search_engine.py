@@ -18,6 +18,8 @@ from sensor_vector_db.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+BM25_MAX_CHUNKS = 50000
+
 
 class SearchEngine:
     """Search engine combining Chroma semantic search with BM25 keyword search."""
@@ -75,7 +77,7 @@ class SearchEngine:
         except ImportError as exc:
             raise RuntimeError("rank-bm25 is required for keyword search.") from exc
 
-        rows = self._load_candidate_chunks(filters)
+        rows = self._load_candidate_chunks(filters, limit=BM25_MAX_CHUNKS)
         if not rows:
             return []
         tokenized = [tokenize_for_search(row["content"]) for row in rows]
@@ -127,8 +129,17 @@ class SearchEngine:
 
         return sorted(combined.values(), key=lambda item: item.score, reverse=True)[:top_k]
 
-    def _load_candidate_chunks(self, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        """Load chunks from SQLite for BM25 indexing."""
+    def _load_candidate_chunks(
+        self,
+        filters: dict[str, Any] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Load chunks from SQLite for BM25 indexing.
+
+        Args:
+            filters: Metadata filters to apply.
+            limit: Maximum chunks to load (guards memory usage). Logs warning if truncated.
+        """
         clauses = []
         clauses.append(Document.status == "imported")
         if filters:
@@ -144,8 +155,20 @@ class SearchEngine:
                 .join(Document, Document.id == DocumentChunk.document_id)
                 .where(*clauses)
             )
+            if limit:
+                statement = statement.limit(limit + 1)
+            all_results = session.execute(statement).all()
+            truncated = limit and len(all_results) > limit
+            if truncated:
+                logger.warning(
+                    "BM25 keyword search truncated to %d chunks (total matched: >%d). "
+                    "Consider adding filters to narrow the search scope.",
+                    limit,
+                    limit,
+                )
+                all_results = all_results[:limit]
             rows = []
-            for chunk, document in session.execute(statement).all():
+            for chunk, document in all_results:
                 metadata = json.loads(chunk.metadata_json or "{}")
                 rows.append(
                     {

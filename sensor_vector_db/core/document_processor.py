@@ -457,7 +457,22 @@ class MetadataExtractor:
             "ul", "ce", "fcc", "rohs", "reach", "mil", "nema",
             "rs", "ip", "usb", "hdmi", "vga", "tcp", "udp", "i2c", "spi",
             "can", "uart", "pwm", "adc", "dac", "led", "lcd", "pcb",
+            "utf", "ascii", "gbk", "big", "euc",
+            "v", "ver", "rev", "rel",
+            "dc", "ac", "db", "hz", "khz", "mhz", "ghz",
+            "kb", "mb", "gb", "tb", "kib", "mib", "gib",
+            "bit", "byte",
+            "api", "sdk", "ide", "cli", "gui", "ui", "url", "uri",
+            "pdf", "doc", "xls", "ppt", "csv", "xml", "json", "html",
+            "cpu", "gpu", "ram", "rom", "ssd", "hdd",
+            "lan", "wan", "wifi", "bt", "ble", "nfc", "rfid",
+            "id", "sn", "pn", "no", "nr",
         }
+    )
+    NON_MODEL_PATTERNS = (
+        r"^v\d",
+        r"^\d+[.]\d+",
+        r"^[a-z]{1,3}\d{1,2}$",
     )
 
     def extract(
@@ -510,6 +525,11 @@ class MetadataExtractor:
             candidate = match.group(1).strip(" ;,，。")
             prefix = re.match(r"[A-Za-z]+", candidate)
             if prefix and prefix.group(0).lower() in self.NON_MODEL_PREFIXES:
+                continue
+            candidate_lower = candidate.lower()
+            if any(re.match(pattern, candidate_lower) for pattern in self.NON_MODEL_PATTERNS):
+                continue
+            if len(candidate) < 4:
                 continue
             return candidate
         return None

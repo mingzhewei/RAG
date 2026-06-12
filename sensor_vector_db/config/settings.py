@@ -3,9 +3,13 @@
 from functools import lru_cache
 import os
 from pathlib import Path
+import threading
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_settings_lock = threading.Lock()
 
 
 class Settings(BaseSettings):
@@ -133,8 +137,9 @@ class Settings(BaseSettings):
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Return cached application settings."""
-    settings = Settings()
-    settings.ensure_directories()
-    settings.apply_resource_limits()
-    return settings
+    """Return cached application settings (thread-safe initialization)."""
+    with _settings_lock:
+        settings = Settings()
+        settings.ensure_directories()
+        settings.apply_resource_limits()
+        return settings

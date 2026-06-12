@@ -48,7 +48,12 @@ class VectorStore:
                 metadatas=[_clean_metadata(item) for item in metadatas],
             )
         except Exception as exc:
-            raise RuntimeError(f"Failed to upsert chunks into ChromaDB: {exc}") from exc
+            first_id = chunk_ids[0] if chunk_ids else "N/A"
+            file_path = metadatas[0].get("file_path", "unknown") if metadatas else "unknown"
+            raise RuntimeError(
+                f"Failed to upsert {len(chunk_ids)} chunks into ChromaDB "
+                f"(first_id={first_id}, file={file_path}): {exc}"
+            ) from exc
 
     def update_metadata(
         self,
@@ -64,7 +69,11 @@ class VectorStore:
                 metadatas=[_clean_metadata(item) for item in metadatas],
             )
         except Exception as exc:
-            raise RuntimeError(f"Failed to update chunk metadata in ChromaDB: {exc}") from exc
+            first_id = chunk_ids[0] if chunk_ids else "N/A"
+            raise RuntimeError(
+                f"Failed to update metadata for {len(chunk_ids)} chunks in ChromaDB "
+                f"(first_id={first_id}): {exc}"
+            ) from exc
 
     def get_embeddings(self, chunk_ids: list[str]) -> dict[str, list[float]]:
         """Return stored embeddings keyed by chunk ID."""
@@ -123,19 +132,48 @@ class VectorStore:
         except Exception as exc:
             logger.warning("Failed to delete vectors for document %s: %s", document_id, exc)
 
-    def delete_stale_for_file(self, file_path: str, keep_chunk_ids: set[str]) -> None:
-        """Delete vectors for a source file that do not belong to current chunks."""
+    def delete_stale_for_file(
+        self,
+        file_path: str,
+        keep_chunk_ids: set[str],
+        document_id: str | None = None,
+    ) -> None:
+        """Delete vectors for a source file that do not belong to current chunks.
+
+        Tries file_path metadata first, then falls back to document_id if provided
+        to ensure orphan vectors are cleaned even when file_path metadata is missing.
+        """
+        stale_ids: set[str] = set()
         try:
             result = self.collection.get(where={"file_path": file_path}, include=["metadatas"])
-            stale_ids = [
+            stale_ids.update(
                 str(chunk_id)
                 for chunk_id in result.get("ids") or []
                 if str(chunk_id) not in keep_chunk_ids
-            ]
-            if stale_ids:
-                self.collection.delete(ids=stale_ids)
+            )
         except Exception as exc:
-            logger.warning("Failed to delete stale vectors for file %s: %s", file_path, exc)
+            logger.warning("Failed to query stale vectors by file_path %s: %s", file_path, exc)
+
+        if document_id:
+            try:
+                result = self.collection.get(
+                    where={"document_id": document_id}, include=["metadatas"]
+                )
+                stale_ids.update(
+                    str(chunk_id)
+                    for chunk_id in result.get("ids") or []
+                    if str(chunk_id) not in keep_chunk_ids
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to query stale vectors by document_id %s: %s", document_id, exc
+                )
+
+        if stale_ids:
+            try:
+                self.collection.delete(ids=list(stale_ids))
+            except Exception as exc:
+                logger.warning("Failed to delete %d stale vectors: %s", len(stale_ids), exc)
 
     def count(self) -> int:
         """Return number of chunks in the collection."""
@@ -158,7 +196,7 @@ class VectorStore:
             distances,
             strict=False,
         ):
-            score = 1.0 / (1.0 + float(distance or 0.0))
+            score = _cosine_distance_to_score(distance)
             search_results.append(
                 SearchResult(
                     chunk_id=chunk_id,
@@ -175,6 +213,17 @@ class VectorStore:
                 )
             )
         return search_results
+
+
+def _cosine_distance_to_score(distance: Any) -> float:
+    """Convert cosine distance to a [0, 1] similarity score.
+
+    ChromaDB cosine distance is in [0, 2] where 0 = identical, 2 = opposite.
+    We convert this to similarity = 1 - (distance / 2), giving [0, 1] range
+    that matches the BM25 normalized score distribution.
+    """
+    dist = float(distance or 0.0)
+    return max(0.0, min(1.0, 1.0 - dist / 2.0))
 
 
 def _build_where_clause(filters: dict[str, Any] | None) -> dict[str, Any] | None:

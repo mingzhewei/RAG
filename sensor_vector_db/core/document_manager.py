@@ -285,7 +285,7 @@ class DocumentManager:
             raise
         if existing_document_id:
             self.vector_store.delete_by_document_id(existing_document_id)
-        self._delete_stale_vectors(str(file_path), set(chunk_ids))
+        self._delete_stale_vectors(str(file_path), set(chunk_ids), document_id)
         self._mark_document_imported(document_id)
         self._emit_progress(
             progress_callback,
@@ -332,7 +332,7 @@ class DocumentManager:
             current_index=current_index,
             total_files=total_files,
         )
-        self._delete_stale_vectors(str(file_path), set(chunk_ids))
+        self._delete_stale_vectors(str(file_path), set(chunk_ids), document_id)
         self._mark_document_imported(document_id)
         self._emit_progress(
             progress_callback,
@@ -486,11 +486,13 @@ class DocumentManager:
         if callable(update_metadata):
             update_metadata(chunk_ids, metadatas)
 
-    def _delete_stale_vectors(self, file_path: str, keep_chunk_ids: set[str]) -> None:
+    def _delete_stale_vectors(
+        self, file_path: str, keep_chunk_ids: set[str], document_id: str | None = None
+    ) -> None:
         """Clean old vectors for a file when the vector store supports it."""
         delete_stale_for_file = getattr(self.vector_store, "delete_stale_for_file", None)
         if callable(delete_stale_for_file):
-            delete_stale_for_file(file_path, keep_chunk_ids)
+            delete_stale_for_file(file_path, keep_chunk_ids, document_id)
 
     def list_documents(self) -> list[dict]:
         """Return imported documents for UI display."""
@@ -873,6 +875,9 @@ class DocumentManager:
     def _restore_document_snapshot(self, snapshot: dict[str, Any]) -> None:
         """Restore a previously indexed document after a failed update."""
         document_data = snapshot["document"]
+        snapshot_doc_id = document_data.get("id")
+        snapshot_chunk_ids = {chunk["id"] for chunk in snapshot.get("chunks", [])}
+
         with session_scope(self.settings) as session:
             current = session.execute(
                 select(Document).where(Document.file_path == document_data["file_path"])
@@ -880,6 +885,19 @@ class DocumentManager:
             if current:
                 session.delete(current)
                 session.flush()
+
+            if snapshot_doc_id:
+                conflict_doc = session.get(Document, snapshot_doc_id)
+                if conflict_doc:
+                    session.delete(conflict_doc)
+                    session.flush()
+
+            for chunk_id in snapshot_chunk_ids:
+                conflict_chunk = session.get(DocumentChunk, chunk_id)
+                if conflict_chunk:
+                    session.delete(conflict_chunk)
+            session.flush()
+
             session.add(Document(**document_data))
             for chunk_data in snapshot["chunks"]:
                 session.add(DocumentChunk(**chunk_data))

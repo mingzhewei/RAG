@@ -24,6 +24,8 @@ class BaseEmbedding(ABC):
 
     def embed_query(self, query: str) -> list[float]:
         """Embed a single query string."""
+        if not query or not query.strip():
+            raise ValueError("Query text cannot be empty for embedding.")
         return self.embed_texts([query])[0]
 
 

@@ -132,6 +132,7 @@ def test_failed_update_restores_previous_document(test_settings, tmp_path: Path)
     assert documents[0].file_hash != ""
     assert any("LDR-100" in chunk.content for chunk in chunks)
     assert not any("LDR-200" in chunk.content for chunk in chunks)
+    assert vector_store.count() == 1
 
 
 def test_incomplete_indexing_document_is_recovered(test_settings, tmp_path: Path) -> None:

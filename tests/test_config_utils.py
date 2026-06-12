@@ -67,3 +67,34 @@ def test_import_filter_excludes_large_txt_csv_and_database_files(tmp_path: Path)
     assert is_supported_file(normal_chroma_doc)
     assert "larger" in (get_file_exclusion_reason(large_txt) or "")
     assert set(iter_supported_files(tmp_path)) == {limit_txt, normal_chroma_doc, small_txt}
+
+
+def test_import_filter_excludes_pcap_audio_and_video_files(tmp_path: Path) -> None:
+    """Import discovery should explicitly reject PCAP and media files."""
+    pcap_file = tmp_path / "capture.pcap"
+    pcap_magic = tmp_path / "capture.bin"
+    audio_file = tmp_path / "sample.mp3"
+    video_file = tmp_path / "clip.mp4"
+    video_ts = tmp_path / "stream.ts"
+    type_script = tmp_path / "driver.ts"
+
+    pcap_file.write_bytes(b"\xd4\xc3\xb2\xa1" + b"\x00" * 20)
+    pcap_magic.write_bytes(b"\x0a\x0d\x0d\x0a" + b"\x00" * 20)
+    audio_file.write_bytes(b"ID3" + b"\x00" * 20)
+    video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 20)
+    video_payload = bytearray(377)
+    video_payload[0] = 0x47
+    video_payload[188] = 0x47
+    video_payload[376] = 0x47
+    video_ts.write_bytes(video_payload)
+    type_script.write_text("export const model = 'LDR-100';", encoding="utf-8")
+
+    assert not is_supported_file(pcap_file)
+    assert not is_supported_file(pcap_magic)
+    assert not is_supported_file(audio_file)
+    assert not is_supported_file(video_file)
+    assert not is_supported_file(video_ts)
+    assert is_supported_file(type_script)
+    assert "PCAP" in (get_file_exclusion_reason(pcap_magic) or "")
+    assert "audio and video" in (get_file_exclusion_reason(audio_file) or "")
+    assert iter_supported_files(tmp_path) == [type_script]

@@ -42,6 +42,7 @@ Copy-Item .env.example .env
 
 - `.txt` 仅导入不大于 1 MiB（1,048,576 bytes）的文件；大于该阈值的 TXT 会被扫描阶段排除。
 - CSV 文件一律排除，不作为 RAG 证据文本入库。
+- PCAP 抓包文件以及音频、视频文件一律排除，不作为 RAG 证据文本入库。
 - 数据库相关文件一律排除，包括 `.db`、`.sqlite`、`.sqlite3`、`.sqlite-wal`、`.sqlite-shm`、`.sql`、`.ddl`、`.dml`、`.dump`、`.bak`，以及 Chroma 运行库目录内的文件。
 
 ## 持久导入
