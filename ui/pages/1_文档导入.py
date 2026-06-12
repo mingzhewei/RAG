@@ -20,7 +20,7 @@ default_path = st.session_state.get("import_path", str(Path("sensor").resolve())
 path = st.text_input("本地文件或文件夹路径", value=default_path, key="import_path")
 cols = st.columns([0.22, 0.78])
 start = cols[0].button("开始/继续同步", type="primary", disabled=not bool(path.strip()))
-cols[1].caption("同步会识别新增、修改、未变化和已删除文件；任务状态持久保存，重启后可继续。")
+cols[1].caption("同步会识别新增、修改、未变化和已删除文件；任务和文件断点持久保存，重启后可继续。")
 
 if start:
     job_id = job_manager.start_import(path.strip())
@@ -90,7 +90,8 @@ def _render_import_job(job_id: str) -> None:
         st.caption(f"当前文件：{job.current_file}")
     st.caption(
         "总文件表示本次目录中识别到的支持文件；已完成包含新增、更新、复用/跳过和失败；"
-        "计划序号用于观察扫描/排队阶段，不等同于已向量化数量。状态区域会局部更新，不刷新整个浏览器页面。"
+        "计划序号用于观察扫描/排队阶段，不等同于已向量化数量。"
+        "单文件恢复会复用已写入 SQLite 的 chunk checkpoint，并补齐缺失向量。"
     )
 
     action_cols = st.columns([0.18, 0.18, 0.64])
@@ -103,7 +104,8 @@ def _render_import_job(job_id: str) -> None:
         st.info("停止请求已发送，任务会在下一个安全检查点中断。")
         st.rerun()
     action_cols[2].caption(
-        "如果上次关机或服务重启导致任务停在 running，但后台线程未运行，可点击恢复。"
+        "如果上次关机或服务重启导致任务停在 running，但后台线程未运行，可点击恢复；"
+        "退出早于文件 checkpoint 时会重新处理当前文件。"
     )
 
     st.subheader("最近事件")

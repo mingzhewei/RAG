@@ -84,6 +84,19 @@ class VectorStore:
             for chunk_id, embedding in zip(ids, embeddings, strict=False)
         }
 
+    def get_existing_ids(self, chunk_ids: list[str]) -> set[str]:
+        """Return chunk IDs that are already present in ChromaDB."""
+        if not chunk_ids:
+            return set()
+        existing: set[str] = set()
+        try:
+            for batch in _batches(chunk_ids, 512):
+                result = self.collection.get(ids=batch, include=["metadatas"])
+                existing.update(str(chunk_id) for chunk_id in result.get("ids") or [])
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read existing chunks from ChromaDB: {exc}") from exc
+        return existing
+
     def query(
         self,
         query_embedding: list[float],
@@ -109,6 +122,20 @@ class VectorStore:
             self.collection.delete(where={"document_id": document_id})
         except Exception as exc:
             logger.warning("Failed to delete vectors for document %s: %s", document_id, exc)
+
+    def delete_stale_for_file(self, file_path: str, keep_chunk_ids: set[str]) -> None:
+        """Delete vectors for a source file that do not belong to current chunks."""
+        try:
+            result = self.collection.get(where={"file_path": file_path}, include=["metadatas"])
+            stale_ids = [
+                str(chunk_id)
+                for chunk_id in result.get("ids") or []
+                if str(chunk_id) not in keep_chunk_ids
+            ]
+            if stale_ids:
+                self.collection.delete(ids=stale_ids)
+        except Exception as exc:
+            logger.warning("Failed to delete stale vectors for file %s: %s", file_path, exc)
 
     def count(self) -> int:
         """Return number of chunks in the collection."""
@@ -177,6 +204,13 @@ def _clean_metadata(metadata: dict[str, Any]) -> dict[str, str | int | float | b
         else:
             cleaned[key] = str(value)
     return cleaned
+
+
+def _batches(items: list[str], size: int):
+    """Yield fixed-size batches."""
+    step = max(1, size)
+    for index in range(0, len(items), step):
+        yield items[index : index + step]
 
 
 def _embedding_to_list(embedding: Any) -> list[float]:

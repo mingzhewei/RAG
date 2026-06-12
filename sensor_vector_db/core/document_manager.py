@@ -17,10 +17,14 @@ from sensor_vector_db.core.document_processor import (
 )
 from sensor_vector_db.core.embedding import BaseEmbedding, create_embedding_provider
 from sensor_vector_db.core.index_profile import build_index_profile, profile_satisfies
-from sensor_vector_db.core.types import ImportErrorItem, ImportReport, TextChunk
+from sensor_vector_db.core.types import ImportErrorItem, ImportReport, OperationCancelled, TextChunk
 from sensor_vector_db.core.vector_store import VectorStore
 from sensor_vector_db.models.database import Document, DocumentChunk, session_scope, utc_now
-from sensor_vector_db.utils.file_utils import get_file_info, iter_supported_files
+from sensor_vector_db.utils.file_utils import (
+    get_file_exclusion_reason,
+    get_file_info,
+    iter_supported_files,
+)
 from sensor_vector_db.utils.hash_utils import calculate_file_md5
 from sensor_vector_db.utils.logger import get_logger
 
@@ -111,6 +115,9 @@ class DocumentManager:
         """Import or update one supported file."""
         self._check_cancelled(cancel_callback)
         file_path = Path(path).resolve()
+        exclusion_reason = get_file_exclusion_reason(file_path)
+        if exclusion_reason:
+            raise ValueError(f"File is excluded from import: {exclusion_reason}")
         self._emit_progress(
             progress_callback,
             current_index,
@@ -125,6 +132,7 @@ class DocumentManager:
         existing_document_id: str | None = None
         existing_snapshot: dict[str, Any] | None = None
         reuse_source_snapshot: dict[str, Any] | None = None
+        resume_document_id: str | None = None
         with session_scope(self.settings) as session:
             existing = session.execute(
                 select(Document).where(Document.file_path == str(file_path))
@@ -146,22 +154,57 @@ class DocumentManager:
                 return "skipped"
             if existing:
                 existing_document_id = existing.id
-                if existing.status == "imported":
+                if (
+                    existing.file_hash == file_hash
+                    and existing.status == "indexing"
+                    and profile_satisfies(existing.index_profile, target_profile)
+                ):
+                    resume_document_id = existing.id
+                    self._emit_progress(
+                        progress_callback,
+                        current_index,
+                        total_files,
+                        str(file_path),
+                        "恢复未完成索引",
+                        "发现同一文件上次已完成分块，准备补齐缺失向量",
+                    )
+                elif existing.status == "imported":
                     existing_snapshot = self._snapshot_document(session, existing)
-                self._emit_progress(
-                    progress_callback,
-                    current_index,
-                    total_files,
-                    str(file_path),
-                    "更新",
-                    "检测到文件变化，准备生成新向量并替换旧索引",
-                )
+                    self._emit_progress(
+                        progress_callback,
+                        current_index,
+                        total_files,
+                        str(file_path),
+                        "更新",
+                        "检测到文件变化，准备生成新向量并替换旧索引",
+                    )
+                else:
+                    self._emit_progress(
+                        progress_callback,
+                        current_index,
+                        total_files,
+                        str(file_path),
+                        "重建未完成索引",
+                        "上次索引没有可复用分块，准备重新解析并重建向量",
+                    )
                 status = "updated"
             else:
                 status = "imported"
             reusable = self._find_reusable_document(session, file_hash, target_profile, existing_document_id)
             if reusable:
                 reuse_source_snapshot = self._snapshot_document(session, reusable)
+
+        if resume_document_id:
+            resumed_status = self._resume_indexing_document(
+                document_id=resume_document_id,
+                file_path=file_path,
+                progress_callback=progress_callback,
+                cancel_callback=cancel_callback,
+                current_index=current_index,
+                total_files=total_files,
+            )
+            if resumed_status:
+                return resumed_status
 
         if reuse_source_snapshot:
             reused_status = self._try_reuse_indexed_document(
@@ -202,30 +245,139 @@ class DocumentManager:
             raise RuntimeError("No indexable text was extracted from the file.")
         metadata = self.metadata_extractor.extract(file_path, segments)
 
-        documents = [chunk.content for chunk in chunks]
-        self._emit_progress(
-            progress_callback,
-            current_index,
-            total_files,
-            str(file_path),
-            "向量化",
-            f"正在生成 {len(documents)} 个文本块的 embedding",
-        )
-        self._check_cancelled(cancel_callback)
-        embeddings = self.embedding.embed_texts(documents)
-        self._check_cancelled(cancel_callback)
-
         self._emit_progress(
             progress_callback,
             current_index,
             total_files,
             str(file_path),
             "写入元数据",
-            f"正在写入 SQLite，chunk 数：{len(chunks)}",
+            f"正在写入 SQLite checkpoint，chunk 数：{len(chunks)}",
         )
-        document_id: str | None = None
-        chunk_ids: list[str] = []
-        metadatas: list[dict] = []
+        document_id, chunk_ids, documents, metadatas = self._create_indexing_checkpoint(
+            file_path=file_path,
+            file_hash=file_hash,
+            file_info=file_info,
+            metadata=metadata,
+            target_profile=target_profile,
+            chunks=chunks,
+            existing_document_id=existing_document_id,
+        )
+        try:
+            self._write_missing_vectors(
+                chunk_ids=chunk_ids,
+                documents=documents,
+                metadatas=metadatas,
+                file_path=file_path,
+                progress_callback=progress_callback,
+                cancel_callback=cancel_callback,
+                current_index=current_index,
+                total_files=total_files,
+            )
+        except OperationCancelled:
+            raise
+        except Exception:
+            self.delete_document(document_id)
+            if existing_snapshot:
+                try:
+                    self._restore_document_snapshot(existing_snapshot)
+                except Exception:
+                    logger.exception("Failed to restore previous document after vector write failure")
+            raise
+        if existing_document_id:
+            self.vector_store.delete_by_document_id(existing_document_id)
+        self._delete_stale_vectors(str(file_path), set(chunk_ids))
+        self._mark_document_imported(document_id)
+        self._emit_progress(
+            progress_callback,
+            current_index,
+            total_files,
+            str(file_path),
+            "完成文件",
+            f"{file_path.name} 已{status}",
+        )
+        return status
+
+    def _resume_indexing_document(
+        self,
+        document_id: str,
+        file_path: Path,
+        progress_callback: ProgressCallback | None,
+        cancel_callback: Callable[[], None] | None,
+        current_index: int,
+        total_files: int,
+    ) -> str | None:
+        """Finish an interrupted file import from persisted chunk rows."""
+        checkpoint = self._load_indexing_checkpoint(document_id, file_path)
+        if not checkpoint:
+            return None
+
+        chunk_ids = checkpoint["chunk_ids"]
+        documents = checkpoint["documents"]
+        metadatas = checkpoint["metadatas"]
+        self._emit_progress(
+            progress_callback,
+            current_index,
+            total_files,
+            str(file_path),
+            "恢复文件断点",
+            f"复用已解析的 {len(chunk_ids)} 个 chunk，补齐缺失向量",
+        )
+        self._write_missing_vectors(
+            chunk_ids=chunk_ids,
+            documents=documents,
+            metadatas=metadatas,
+            file_path=file_path,
+            progress_callback=progress_callback,
+            cancel_callback=cancel_callback,
+            current_index=current_index,
+            total_files=total_files,
+        )
+        self._delete_stale_vectors(str(file_path), set(chunk_ids))
+        self._mark_document_imported(document_id)
+        self._emit_progress(
+            progress_callback,
+            current_index,
+            total_files,
+            str(file_path),
+            "完成文件",
+            f"{file_path.name} 已从文件断点恢复完成",
+        )
+        return "updated"
+
+    def _load_indexing_checkpoint(self, document_id: str, file_path: Path) -> dict[str, Any] | None:
+        """Load persisted chunks for an interrupted indexing document."""
+        with session_scope(self.settings) as session:
+            document = session.get(Document, document_id)
+            if (
+                not document
+                or document.status != "indexing"
+                or document.file_path != str(file_path)
+            ):
+                return None
+            chunks = session.execute(
+                select(DocumentChunk)
+                .where(DocumentChunk.document_id == document.id)
+                .order_by(DocumentChunk.chunk_index)
+            ).scalars().all()
+            if not chunks:
+                return None
+            return {
+                "chunk_ids": [chunk.id for chunk in chunks],
+                "documents": [chunk.content for chunk in chunks],
+                "metadatas": [self._chunk_metadata(document, chunk) for chunk in chunks],
+            }
+
+    def _create_indexing_checkpoint(
+        self,
+        file_path: Path,
+        file_hash: str,
+        file_info: Any,
+        metadata: dict[str, Any],
+        target_profile: str,
+        chunks: list[TextChunk],
+        existing_document_id: str | None,
+    ) -> tuple[str, list[str], list[str], list[dict]]:
+        """Persist parsed chunks before vectorization so the file can resume."""
         with session_scope(self.settings) as session:
             if existing_document_id:
                 existing = session.get(Document, existing_document_id)
@@ -255,46 +407,90 @@ class DocumentManager:
             )
             session.add(document)
             session.flush()
-            document_id = document.id
             db_chunks = self._persist_chunks(session, document, chunks)
             chunk_ids = [chunk.id for chunk in db_chunks]
-            metadatas = [
-                self._chunk_metadata(document, chunk)
-                for chunk in db_chunks
-            ]
+            documents = [chunk.content for chunk in db_chunks]
+            metadatas = [self._chunk_metadata(document, chunk) for chunk in db_chunks]
+            return document.id, chunk_ids, documents, metadatas
 
-        self._emit_progress(
-            progress_callback,
-            current_index,
-            total_files,
-            str(file_path),
-            "写入向量库",
-            "正在写入 ChromaDB",
-        )
-        try:
-            self.vector_store.add_chunks(chunk_ids, documents, embeddings, metadatas)
-        except Exception:
-            if document_id:
-                self.delete_document(document_id)
-            if existing_snapshot:
-                try:
-                    self._restore_document_snapshot(existing_snapshot)
-                except Exception:
-                    logger.exception("Failed to restore previous document after vector write failure")
-            raise
-        if existing_document_id:
-            self.vector_store.delete_by_document_id(existing_document_id)
-        if document_id:
-            self._mark_document_imported(document_id)
-        self._emit_progress(
-            progress_callback,
-            current_index,
-            total_files,
-            str(file_path),
-            "完成文件",
-            f"{file_path.name} 已{status}",
-        )
-        return status
+    def _write_missing_vectors(
+        self,
+        chunk_ids: list[str],
+        documents: list[str],
+        metadatas: list[dict],
+        file_path: Path,
+        progress_callback: ProgressCallback | None,
+        cancel_callback: Callable[[], None] | None,
+        current_index: int,
+        total_files: int,
+    ) -> None:
+        """Embed and upsert only chunks that are missing from ChromaDB."""
+        self._check_cancelled(cancel_callback)
+        existing_ids = self._existing_vector_ids(chunk_ids)
+        missing_positions = [
+            index for index, chunk_id in enumerate(chunk_ids) if chunk_id not in existing_ids
+        ]
+        if not missing_positions:
+            self._emit_progress(
+                progress_callback,
+                current_index,
+                total_files,
+                str(file_path),
+                "向量已完整",
+                f"{file_path.name} 的 {len(chunk_ids)} 个向量已存在，正在刷新元数据",
+            )
+            self._update_vector_metadata(chunk_ids, metadatas)
+            return
+
+        batch_size = max(1, int(self.settings.embedding_batch_size or 1))
+        completed = 0
+        for batch_positions in _batches(missing_positions, batch_size):
+            self._check_cancelled(cancel_callback)
+            start = completed + 1
+            end = completed + len(batch_positions)
+            self._emit_progress(
+                progress_callback,
+                current_index,
+                total_files,
+                str(file_path),
+                "向量化",
+                f"正在生成缺失向量 {start}-{end}/{len(missing_positions)}",
+            )
+            batch_documents = [documents[index] for index in batch_positions]
+            embeddings = self.embedding.embed_texts(batch_documents)
+            self._check_cancelled(cancel_callback)
+            batch_chunk_ids = [chunk_ids[index] for index in batch_positions]
+            batch_metadatas = [metadatas[index] for index in batch_positions]
+            self._emit_progress(
+                progress_callback,
+                current_index,
+                total_files,
+                str(file_path),
+                "写入向量库",
+                f"正在写入 ChromaDB batch {start}-{end}/{len(missing_positions)}",
+            )
+            self.vector_store.add_chunks(batch_chunk_ids, batch_documents, embeddings, batch_metadatas)
+            completed = end
+        self._update_vector_metadata(chunk_ids, metadatas)
+
+    def _existing_vector_ids(self, chunk_ids: list[str]) -> set[str]:
+        """Return already indexed chunk IDs when the vector store supports it."""
+        get_existing_ids = getattr(self.vector_store, "get_existing_ids", None)
+        if callable(get_existing_ids):
+            return set(get_existing_ids(chunk_ids))
+        return set()
+
+    def _update_vector_metadata(self, chunk_ids: list[str], metadatas: list[dict]) -> None:
+        """Refresh vector metadata when the vector store supports it."""
+        update_metadata = getattr(self.vector_store, "update_metadata", None)
+        if callable(update_metadata):
+            update_metadata(chunk_ids, metadatas)
+
+    def _delete_stale_vectors(self, file_path: str, keep_chunk_ids: set[str]) -> None:
+        """Clean old vectors for a file when the vector store supports it."""
+        delete_stale_for_file = getattr(self.vector_store, "delete_stale_for_file", None)
+        if callable(delete_stale_for_file):
+            delete_stale_for_file(file_path, keep_chunk_ids)
 
     def list_documents(self) -> list[dict]:
         """Return imported documents for UI display."""
@@ -770,3 +966,10 @@ class DocumentManager:
         """Run an optional cancellation checkpoint."""
         if cancel_callback:
             cancel_callback()
+
+
+def _batches(items: list[int], size: int):
+    """Yield fixed-size batches."""
+    step = max(1, size)
+    for index in range(0, len(items), step):
+        yield items[index : index + step]

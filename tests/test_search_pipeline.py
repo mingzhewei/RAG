@@ -7,9 +7,12 @@ from sqlalchemy import select
 
 from sensor_vector_db.core.document_manager import DocumentManager
 from sensor_vector_db.core.embedding import DeterministicEmbedding
+from sensor_vector_db.core.index_profile import build_index_profile
 from sensor_vector_db.core.search_engine import SearchEngine
 from sensor_vector_db.core.vector_store import VectorStore, _build_where_clause
 from sensor_vector_db.models.database import Document, DocumentChunk, session_scope
+from sensor_vector_db.utils.file_utils import get_file_info
+from sensor_vector_db.utils.hash_utils import calculate_file_md5
 
 
 def test_build_where_clause_handles_filter_counts() -> None:
@@ -20,6 +23,17 @@ def test_build_where_clause_handles_filter_counts() -> None:
     assert _build_where_clause({"file_type": "pdf", "sensor_model": "X"}) == {
         "$and": [{"file_type": "pdf"}, {"sensor_model": "X"}]
     }
+
+
+def test_direct_file_import_rejects_excluded_csv(test_settings, tmp_path: Path) -> None:
+    """The single-file import path must enforce the same CSV exclusion rule."""
+    source = tmp_path / "sensor_table.csv"
+    source.write_text("model,range\nLDR-100,100 m", encoding="utf-8")
+
+    manager = DocumentManager(test_settings)
+
+    with pytest.raises(ValueError, match="CSV files are excluded"):
+        manager.import_file(source)
 
 
 def test_semantic_search_with_two_filters(test_settings, tmp_path: Path) -> None:
@@ -120,8 +134,8 @@ def test_failed_update_restores_previous_document(test_settings, tmp_path: Path)
     assert not any("LDR-200" in chunk.content for chunk in chunks)
 
 
-def test_incomplete_indexing_document_is_rebuilt(test_settings, tmp_path: Path) -> None:
-    """A half-written document should not be skipped after a hard process kill."""
+def test_incomplete_indexing_document_is_recovered(test_settings, tmp_path: Path) -> None:
+    """A half-written document should be recovered after a hard process kill."""
     source = tmp_path / "lidar.txt"
     source.write_text("Model: LDR-100\nRange: 100 m", encoding="utf-8")
     embedding = DeterministicEmbedding(dimension=64)
@@ -141,6 +155,96 @@ def test_incomplete_indexing_document_is_rebuilt(test_settings, tmp_path: Path) 
     search = SearchEngine(test_settings, embedding=embedding, vector_store=vector_store)
     results = search.search("LDR-100", mode="hybrid", top_k=3)
     assert results
+
+
+def test_incomplete_indexing_document_resumes_missing_vectors(
+    test_settings, tmp_path: Path
+) -> None:
+    """A file-level checkpoint should resume only Chroma chunks that are missing."""
+    source = tmp_path / "lidar.txt"
+    first_text = "Model: LDR-100\nRange: 100 m"
+    second_text = "Accuracy: 5 cm\nInterface: RS485"
+    source.write_text(f"{first_text}\n\n{second_text}", encoding="utf-8")
+    file_info = get_file_info(source)
+    file_hash = calculate_file_md5(source)
+    embedding = CountingEmbedding(dimension=64)
+    vector_store = VectorStore(test_settings)
+
+    with session_scope(test_settings) as session:
+        document = Document(
+            file_path=str(source.resolve()),
+            filename=source.name,
+            file_type=file_info.file_type,
+            file_hash=file_hash,
+            size_bytes=file_info.size_bytes,
+            created_at=file_info.created_at,
+            modified_at=file_info.modified_at,
+            status="indexing",
+            sensor_model="LDR-100",
+            index_profile=build_index_profile(test_settings),
+        )
+        session.add(document)
+        session.flush()
+        first_chunk = DocumentChunk(
+            document_id=document.id,
+            chunk_index=0,
+            content=first_text,
+            content_type="text",
+            source_label=f"{source.name} #0",
+        )
+        second_chunk = DocumentChunk(
+            document_id=document.id,
+            chunk_index=1,
+            content=second_text,
+            content_type="text",
+            source_label=f"{source.name} #1",
+        )
+        session.add_all([first_chunk, second_chunk])
+        session.flush()
+        document_id = document.id
+        first_chunk_id = first_chunk.id
+        second_chunk_id = second_chunk.id
+
+    first_embedding = embedding.embed_texts([first_text])[0]
+    vector_store.add_chunks(
+        [first_chunk_id],
+        [first_text],
+        [first_embedding],
+        [
+            {
+                "document_id": document_id,
+                "source_label": f"{source.name} #0",
+                "file_path": str(source.resolve()),
+                "file_type": file_info.file_type,
+                "file_hash": file_hash,
+                "filename": source.name,
+                "chunk_index": 0,
+                "content_type": "text",
+                "sensor_model": "LDR-100",
+            }
+        ],
+    )
+    embedding.calls = 0
+    embedding.text_count = 0
+
+    manager = DocumentManager(test_settings, embedding=embedding, vector_store=vector_store)
+
+    def fail_parse(*args, **kwargs):
+        raise AssertionError("checkpoint resume should not reparse the file")
+
+    manager.parser_factory.parse = fail_parse
+
+    assert manager.import_file(source) == "updated"
+    assert embedding.calls == 1
+    assert embedding.text_count == 1
+    assert vector_store.get_existing_ids([first_chunk_id, second_chunk_id]) == {
+        first_chunk_id,
+        second_chunk_id,
+    }
+    with session_scope(test_settings) as session:
+        document = session.get(Document, document_id)
+        assert document is not None
+        assert document.status == "imported"
 
 
 def test_duplicate_hash_reuses_existing_vectors(test_settings, tmp_path: Path) -> None:
