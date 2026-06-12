@@ -212,6 +212,7 @@ class ImportJobFile(Base):
 
 
 _ENGINE_CACHE: dict[str, "Engine"] = {}
+_SESSION_FACTORY_CACHE: dict[str, "sessionmaker[Session]"] = {}
 
 
 def get_engine(settings: Settings | None = None):
@@ -256,9 +257,14 @@ def init_database(settings: Settings | None = None) -> None:
 
 
 def get_session_factory(settings: Settings | None = None) -> sessionmaker[Session]:
-    """Return a SQLAlchemy session factory."""
+    """Return a cached SQLAlchemy session factory."""
     engine = get_engine(settings)
-    return sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    cache_key = str(engine.url)
+    if cache_key not in _SESSION_FACTORY_CACHE:
+        _SESSION_FACTORY_CACHE[cache_key] = sessionmaker(
+            bind=engine, expire_on_commit=False, future=True
+        )
+    return _SESSION_FACTORY_CACHE[cache_key]
 
 
 @contextmanager
