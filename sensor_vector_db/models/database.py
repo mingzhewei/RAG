@@ -211,11 +211,41 @@ class ImportJobFile(Base):
     job: Mapped[ImportJob] = relationship(back_populates="files")
 
 
+_ENGINE_CACHE: dict[str, "Engine"] = {}
+
+
 def get_engine(settings: Settings | None = None):
-    """Create a SQLite engine for the configured database."""
+    """Return a cached SQLite engine with WAL mode and busy timeout.
+
+    WAL (Write-Ahead Logging) allows concurrent readers while a writer holds
+    the lock. The 30-second busy timeout gives the import thread time to
+    finish its transaction before UI polling queries give up.
+    """
     runtime_settings = settings or get_settings()
     runtime_settings.ensure_directories()
-    return create_engine(f"sqlite:///{runtime_settings.sqlite_path}", future=True)
+    cache_key = str(runtime_settings.sqlite_path.resolve())
+    if cache_key in _ENGINE_CACHE:
+        return _ENGINE_CACHE[cache_key]
+
+    from sqlalchemy.event import listen
+    from sqlalchemy.engine import Engine
+
+    engine = create_engine(
+        f"sqlite:///{runtime_settings.sqlite_path}",
+        future=True,
+        connect_args={"timeout": 30, "check_same_thread": False},
+    )
+
+    def _set_sqlite_pragma(dbapi_conn, connection_record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
+
+    listen(engine, "connect", _set_sqlite_pragma)
+    _ENGINE_CACHE[cache_key] = engine
+    return engine
 
 
 def init_database(settings: Settings | None = None) -> None:
