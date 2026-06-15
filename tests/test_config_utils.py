@@ -26,6 +26,39 @@ def test_settings_create_directories(tmp_path: Path) -> None:
     assert settings.log_file.parent.exists()
 
 
+def test_settings_default_to_crs_llm() -> None:
+    """CRS should be the default LLM provider with Responses API wiring."""
+    settings = Settings(crs_api_key="test-key", crs="gpt-5.5")
+
+    assert settings.llm_provider == "crs"
+    assert settings.wire_api == "responses"
+    assert settings.active_llm_api_key == "test-key"
+    assert settings.active_llm_model == "gpt-5.5"
+    assert settings.active_llm_base_url == "https://crs.acerobotics.com/openai"
+
+
+def test_settings_can_switch_to_deepseek_llm() -> None:
+    """The LLM provider switch should still support DeepSeek."""
+    settings = Settings(
+        llm_provider="deepseek",
+        deepseek_api_key="deepseek-key",
+        deepseek_model="deepseek-test",
+    )
+
+    assert settings.active_llm_api_key == "deepseek-key"
+    assert settings.active_llm_model == "deepseek-test"
+    assert settings.active_llm_base_url == "https://api.deepseek.com"
+
+
+def test_settings_can_disable_llm() -> None:
+    """The LLM provider switch should support local-only mode."""
+    settings = Settings(llm_provider="none")
+
+    assert settings.active_llm_api_key is None
+    assert settings.active_llm_model == ""
+    assert settings.active_llm_base_url == ""
+
+
 def test_file_type_and_hash(tmp_path: Path) -> None:
     """Supported file types and MD5 hashes should be deterministic."""
     txt = tmp_path / "sensor.txt"

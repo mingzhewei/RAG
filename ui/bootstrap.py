@@ -96,11 +96,39 @@ def apply_compact_style() -> None:
     )
 
 
+def apply_runtime_llm_settings(
+    provider: str,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    model: str | None = None,
+    wire_api: str | None = None,
+) -> None:
+    """Apply LLM settings for the current Streamlit process."""
+    os.environ["LLM_PROVIDER"] = provider.strip().lower()
+    if wire_api and wire_api.strip():
+        os.environ["WIRE_API"] = wire_api.strip().lower()
+    if base_url and base_url.strip():
+        if provider == "crs":
+            os.environ["CRS_BASE_URL"] = base_url.strip()
+        elif provider == "deepseek":
+            os.environ["DEEPSEEK_BASE_URL"] = base_url.strip()
+    if model and model.strip():
+        if provider == "crs":
+            os.environ["CRS"] = model.strip()
+        elif provider == "deepseek":
+            os.environ["DEEPSEEK_MODEL"] = model.strip()
+    if api_key and api_key.strip():
+        if provider == "crs":
+            os.environ["CRS_API_KEY"] = api_key.strip()
+        elif provider == "deepseek":
+            os.environ["DEEPSEEK_API_KEY"] = api_key.strip()
+    get_settings.cache_clear()
+
+
 def apply_runtime_api_key(api_key: str) -> None:
-    """Apply a DeepSeek API key for the current Streamlit process."""
-    if api_key.strip():
-        os.environ["DEEPSEEK_API_KEY"] = api_key.strip()
-        get_settings.cache_clear()
+    """Apply an API key for the current selected LLM provider."""
+    settings = get_settings()
+    apply_runtime_llm_settings(settings.llm_provider, api_key=api_key)
 
 
 @st.cache_resource(show_spinner=False)

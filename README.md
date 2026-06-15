@@ -1,6 +1,6 @@
 # 本地传感器 RAG 检索 MVP
 
-这是一个本地运行的传感器技术文档 RAG 检索系统。系统以本地向量库为核心，支持 PDF、DOCX、受控文本和代码文件导入，扫描 PDF 可启用 PaddleOCR，本地 embedding 默认使用 `BAAI/bge-m3`，问答生成通过 DeepSeek Chat API 完成。
+这是一个本地运行的传感器技术文档 RAG 检索系统。系统以本地向量库为核心，支持 PDF、DOCX、受控文本和代码文件导入，扫描 PDF 可启用 PaddleOCR，本地 embedding 默认使用 `BAAI/bge-m3`，问答生成默认通过 CRS OpenAI-compatible 接口完成，也可切换到 DeepSeek 或关闭大模型调用。
 
 ## 运行
 
@@ -22,11 +22,11 @@ Copy-Item .env.example .env
 .\.venv\Scripts\python main.py --port 8502
 ```
 
-`DEEPSEEK_API_KEY` 只写入 `.env` 或在 Streamlit 系统管理页临时输入，不要提交到 Git。
+大模型密钥只写入 `.env` 或在 Streamlit 系统管理页临时输入，不要提交到 Git。默认配置为 `LLM_PROVIDER=crs`、`WIRE_API=responses`、`CRS=gpt-5.5`；需要切回 DeepSeek 时把 `LLM_PROVIDER=deepseek`，需要完全禁用生成时设为 `LLM_PROVIDER=none`。
 
 ## 轻量测试
 
-测试默认使用 deterministic fake embedding，不会下载 BGE-M3，也不会调用 DeepSeek。
+测试默认使用 deterministic fake embedding，不会下载 BGE-M3，也不会调用外部大模型。
 
 ```powershell
 .\.venv\Scripts\pytest

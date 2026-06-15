@@ -172,6 +172,6 @@ def test_manager_recovers_orphaned_running_job(test_settings, tmp_path: Path) ->
 
 def test_error_classification_for_user_messages() -> None:
     """Known failure classes should produce actionable user-facing messages."""
-    assert "DeepSeek token" in classify_error(RuntimeError("401 invalid token"))
+    assert "大模型 API token" in classify_error(RuntimeError("401 invalid token"))
     assert "服务器连接" in classify_error(RuntimeError("connection timeout"))
     assert "向量化失败" in classify_error(RuntimeError("BGE embedding failed"))

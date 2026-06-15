@@ -128,7 +128,7 @@ class DocumentManager:
         )
         file_hash = calculate_file_md5(file_path)
         file_info = get_file_info(file_path)
-        target_profile = build_index_profile(self.settings)
+        target_profile = build_index_profile(self.settings, file_info.file_type)
         existing_document_id: str | None = None
         existing_snapshot: dict[str, Any] | None = None
         reuse_source_snapshot: dict[str, Any] | None = None

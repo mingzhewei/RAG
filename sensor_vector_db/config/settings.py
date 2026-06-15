@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     deepseek_base_url: str = Field(default="https://api.deepseek.com")
     deepseek_model: str = Field(default="deepseek-v4-flash")
     deepseek_timeout_seconds: int = Field(default=60)
+    llm_provider: str = Field(default="crs")
+    wire_api: str = Field(default="responses")
+    llm_timeout_seconds: int = Field(default=60)
+    crs_api_key: str | None = Field(default=None)
+    crs_base_url: str = Field(default="https://crs.acerobotics.com/openai")
+    crs: str = Field(default="gpt-5.5")
 
     embedding_model: str = Field(default="BAAI/bge-m3")
     embedding_backend: str = Field(default="bge")
@@ -101,6 +107,14 @@ class Settings(BaseSettings):
             raise ValueError("Numeric runtime settings must be positive.")
         return value
 
+    @field_validator("llm_timeout_seconds", "deepseek_timeout_seconds")
+    @classmethod
+    def _validate_positive_timeout(cls, value: int) -> int:
+        """Validate positive timeout settings."""
+        if value < 1:
+            raise ValueError("Timeout settings must be positive.")
+        return value
+
     @field_validator("ocr_min_text_chars", "ocr_max_pages_per_file", "native_thread_limit")
     @classmethod
     def _validate_non_negative_integer(cls, value: int) -> int:
@@ -108,6 +122,51 @@ class Settings(BaseSettings):
         if value < 0:
             raise ValueError("Numeric runtime settings must be non-negative.")
         return value
+
+    @field_validator("llm_provider")
+    @classmethod
+    def _validate_llm_provider(cls, value: str) -> str:
+        """Validate the selected LLM provider."""
+        normalized = value.strip().lower()
+        if normalized not in {"crs", "deepseek", "none"}:
+            raise ValueError("LLM_PROVIDER must be one of: crs, deepseek, none.")
+        return normalized
+
+    @field_validator("wire_api")
+    @classmethod
+    def _validate_wire_api(cls, value: str) -> str:
+        """Validate the OpenAI-compatible API surface."""
+        normalized = value.strip().lower()
+        if normalized not in {"responses", "chat_completions"}:
+            raise ValueError("WIRE_API must be one of: responses, chat_completions.")
+        return normalized
+
+    @property
+    def active_llm_api_key(self) -> str | None:
+        """Return the API key for the selected LLM provider."""
+        if self.llm_provider == "crs":
+            return self.crs_api_key
+        if self.llm_provider == "deepseek":
+            return self.deepseek_api_key
+        return None
+
+    @property
+    def active_llm_base_url(self) -> str:
+        """Return the base URL for the selected LLM provider."""
+        if self.llm_provider == "crs":
+            return self.crs_base_url
+        if self.llm_provider == "deepseek":
+            return self.deepseek_base_url
+        return ""
+
+    @property
+    def active_llm_model(self) -> str:
+        """Return the model name for the selected LLM provider."""
+        if self.llm_provider == "crs":
+            return self.crs
+        if self.llm_provider == "deepseek":
+            return self.deepseek_model
+        return ""
 
     def ensure_directories(self) -> None:
         """Create data and log directories required by the application."""

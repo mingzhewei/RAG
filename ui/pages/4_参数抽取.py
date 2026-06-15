@@ -15,7 +15,7 @@ st.title("参数抽取")
 documents = get_document_manager().list_documents()
 options = {f"{doc['filename']} · {doc['id']}": doc["id"] for doc in documents}
 selected = st.selectbox("文档", list(options.keys())) if options else None
-use_llm = st.checkbox("使用 DeepSeek 校验字段名", value=True)
+use_llm = st.checkbox("使用当前大模型校验字段名", value=True)
 
 if selected and st.button("抽取参数", type="primary"):
     document_id = options[selected]

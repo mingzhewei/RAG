@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from bootstrap import (
-    apply_runtime_api_key,
+    apply_runtime_llm_settings,
     clear_resource_caches,
     configure_page,
     get_document_manager,
@@ -29,11 +29,40 @@ cols[2].metric("Vectors", stats["vectors"])
 st.subheader("路径")
 st.code(f"SQLite: {settings.sqlite_path}\nChroma: {settings.chroma_path}\nLog: {settings.log_file}")
 
-st.subheader("DeepSeek")
-st.write("API Key 状态：", "已配置" if settings.deepseek_api_key else "未配置")
-api_key = st.text_input("DeepSeek API Key", type="password")
-if st.button("应用到当前会话", disabled=not bool(api_key.strip())):
-    apply_runtime_api_key(api_key)
+st.subheader("大模型")
+st.write(
+    {
+        "llm_provider": settings.llm_provider,
+        "wire_api": settings.wire_api,
+        "model": settings.active_llm_model,
+        "base_url": settings.active_llm_base_url,
+        "api_key": "已配置" if settings.active_llm_api_key else "未配置",
+    }
+)
+provider = st.selectbox(
+    "提供方",
+    ["crs", "deepseek", "none"],
+    index=["crs", "deepseek", "none"].index(settings.llm_provider),
+)
+wire_api = st.selectbox(
+    "OpenAI-compatible API",
+    ["responses", "chat_completions"],
+    index=["responses", "chat_completions"].index(settings.wire_api),
+    disabled=provider == "none",
+)
+default_base_url = settings.crs_base_url if provider == "crs" else settings.deepseek_base_url
+default_model = settings.crs if provider == "crs" else settings.deepseek_model
+base_url = st.text_input("Base URL", value="" if provider == "none" else default_base_url)
+model = st.text_input("Model", value="" if provider == "none" else default_model)
+api_key = st.text_input("API Key（留空则沿用 .env 或当前环境）", type="password")
+if st.button("应用大模型设置到当前会话"):
+    apply_runtime_llm_settings(
+        provider=provider,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        wire_api=wire_api,
+    )
     clear_resource_caches()
     st.success("已应用。")
 
@@ -61,4 +90,3 @@ if st.button("重算已入库型号/厂商"):
     with st.spinner("正在刷新元数据..."):
         result = manager.refresh_sensor_models(overwrite=overwrite)
     st.success(f"已扫描 {result['scanned']} 个文档，更新 {result['updated']} 个。")
-

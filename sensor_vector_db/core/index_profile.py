@@ -8,18 +8,19 @@ from typing import Any
 from sensor_vector_db.config.settings import Settings
 
 
-def build_index_profile(settings: Settings) -> str:
+def build_index_profile(settings: Settings, file_type: str | None = None) -> str:
     """Return a stable profile for extraction, chunking, and embedding settings."""
+    ocr_mode = settings.ocr_enabled and file_type == "pdf"
     profile: dict[str, Any] = {
         "version": 1,
-        "mode": "ocr" if settings.ocr_enabled else "text",
+        "mode": "ocr" if ocr_mode else "text",
         "chunk_size": settings.chunk_size,
         "chunk_overlap": settings.chunk_overlap,
         "embedding_backend": settings.embedding_backend,
         "embedding_model": settings.embedding_model,
         "embedding_dimension": settings.embedding_dimension,
     }
-    if settings.ocr_enabled:
+    if ocr_mode:
         profile.update(
             {
                 "ocr_lang": settings.ocr_lang,
@@ -34,7 +35,8 @@ def build_index_profile(settings: Settings) -> str:
 def profile_satisfies(existing_profile: str | None, target_profile: str) -> bool:
     """Return whether an existing document profile satisfies the requested profile."""
     if not existing_profile:
-        return True
+        target = _parse_profile(target_profile)
+        return not target or target.get("mode") != "ocr"
     if existing_profile == target_profile:
         return True
     existing = _parse_profile(existing_profile)

@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from sensor_vector_db.core.document_manager import DocumentManager
 from sensor_vector_db.core.embedding import DeterministicEmbedding
-from sensor_vector_db.core.index_profile import build_index_profile
+from sensor_vector_db.core.index_profile import build_index_profile, profile_satisfies
 from sensor_vector_db.core.search_engine import SearchEngine
 from sensor_vector_db.core.vector_store import VectorStore, _build_where_clause
 from sensor_vector_db.models.database import Document, DocumentChunk, session_scope
@@ -23,6 +23,15 @@ def test_build_where_clause_handles_filter_counts() -> None:
     assert _build_where_clause({"file_type": "pdf", "sensor_model": "X"}) == {
         "$and": [{"file_type": "pdf"}, {"sensor_model": "X"}]
     }
+
+
+def test_missing_profile_does_not_satisfy_pdf_ocr_target(test_settings) -> None:
+    """Legacy missing profiles should be rebuilt only for PDF OCR targets."""
+    ocr_settings = test_settings.model_copy(update={"ocr_enabled": True})
+
+    assert not profile_satisfies(None, build_index_profile(ocr_settings, "pdf"))
+    assert profile_satisfies(None, build_index_profile(ocr_settings, "text"))
+    assert profile_satisfies(None, build_index_profile(test_settings, "pdf"))
 
 
 def test_direct_file_import_rejects_excluded_csv(test_settings, tmp_path: Path) -> None:
@@ -353,10 +362,37 @@ def test_refresh_sensor_models_can_preserve_existing_values(
         assert document.sensor_model == "CUSTOM-TAG"
 
 
-def test_same_hash_rebuilds_when_ocr_profile_is_requested(test_settings, tmp_path: Path) -> None:
-    """A text-only index should be rebuilt when OCR indexing is later requested."""
+def test_text_file_is_not_rebuilt_when_ocr_profile_is_requested(
+    test_settings, tmp_path: Path
+) -> None:
+    """OCR settings should not force non-PDF documents to be rebuilt."""
     source = tmp_path / "lidar.txt"
     source.write_text("Model: LDR-100\nRange: 100 m", encoding="utf-8")
+
+    manager = DocumentManager(test_settings)
+    assert manager.import_file(source) == "imported"
+
+    with session_scope(test_settings) as session:
+        first_document = session.execute(select(Document)).scalar_one()
+        assert '"mode":"text"' in (first_document.index_profile or "")
+
+    ocr_settings = test_settings.model_copy(update={"ocr_enabled": True})
+    ocr_manager = DocumentManager(ocr_settings)
+    assert ocr_manager.import_file(source) == "skipped"
+
+    with session_scope(ocr_settings) as session:
+        document = session.execute(select(Document)).scalar_one()
+        assert '"mode":"text"' in (document.index_profile or "")
+
+
+def test_pdf_rebuilds_when_ocr_profile_is_requested(test_settings, tmp_path: Path) -> None:
+    """A text-only PDF index should be rebuilt when OCR indexing is requested."""
+    reportlab = pytest.importorskip("reportlab.pdfgen.canvas")
+    source = tmp_path / "lidar.pdf"
+    canvas = reportlab.Canvas(str(source))
+    canvas.drawString(72, 720, "Model: LDR-100")
+    canvas.drawString(72, 700, "Range: 100 m")
+    canvas.save()
 
     manager = DocumentManager(test_settings)
     assert manager.import_file(source) == "imported"

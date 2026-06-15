@@ -13,7 +13,7 @@ from sqlalchemy import delete, select
 
 from sensor_vector_db.config.settings import Settings, get_settings
 from sensor_vector_db.core.import_jobs import classify_error
-from sensor_vector_db.core.llm_client import DeepseekChatClient
+from sensor_vector_db.core.llm_client import create_llm_client
 from sensor_vector_db.models.database import (
     Document,
     DocumentChunk,
@@ -72,7 +72,7 @@ class ParameterExtractor:
     def __init__(self, settings: Settings | None = None) -> None:
         """Initialize extractor."""
         self.settings = settings or get_settings()
-        self.llm_client = DeepseekChatClient(self.settings)
+        self.llm_client = create_llm_client(self.settings)
         self.last_warning: str | None = None
 
     def extract_for_document(self, document_id: str, use_llm: bool = True) -> list[ParameterValue]:
@@ -89,7 +89,7 @@ class ParameterExtractor:
                 delete(ExtractedParameter).where(ExtractedParameter.document_id == document_id)
             )
             parameters = self.extract_from_chunks(chunks)
-            if use_llm and self.settings.deepseek_api_key:
+            if use_llm and self.settings.active_llm_api_key:
                 parameters = self._llm_validate(parameters, chunks)
             sensor_model = document.sensor_model or _first_value(parameters, "model")
             for parameter in parameters:
@@ -217,7 +217,7 @@ class ParameterExtractor:
         parameters: list[ParameterValue],
         chunks: list[DocumentChunk],
     ) -> list[ParameterValue]:
-        """Ask DeepSeek to validate field names, never to invent missing values."""
+        """Ask the active LLM to validate field names, never to invent missing values."""
         if not parameters:
             return parameters
         sample = [
@@ -248,7 +248,7 @@ class ParameterExtractor:
             response = self.llm_client.chat(messages)
             decoded = json.loads(_extract_json(str(response)))
         except Exception as exc:
-            self.last_warning = classify_error(exc, "DeepSeek 参数校验")
+            self.last_warning = classify_error(exc, "大模型参数校验")
             logger.warning("LLM parameter validation skipped: %s", self.last_warning)
             return parameters
         valid_keys = {

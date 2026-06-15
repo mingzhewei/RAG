@@ -6,7 +6,11 @@ import json
 
 from sensor_vector_db.config.settings import Settings, get_settings
 from sensor_vector_db.core.import_jobs import classify_error
-from sensor_vector_db.core.llm_client import DeepseekChatClient, NullLLMClient
+from sensor_vector_db.core.llm_client import (
+    NullLLMClient,
+    OpenAICompatibleChatClient,
+    create_llm_client,
+)
 from sensor_vector_db.core.search_engine import SearchEngine
 from sensor_vector_db.core.types import SearchResult
 from sensor_vector_db.models.database import QueryHistory, session_scope
@@ -22,16 +26,12 @@ class QASystem:
         self,
         settings: Settings | None = None,
         search_engine: SearchEngine | None = None,
-        llm_client: DeepseekChatClient | NullLLMClient | None = None,
+        llm_client: OpenAICompatibleChatClient | NullLLMClient | None = None,
     ) -> None:
         """Initialize QA system."""
         self.settings = settings or get_settings()
         self.search_engine = search_engine or SearchEngine(self.settings)
-        self.llm_client = llm_client or (
-            DeepseekChatClient(self.settings)
-            if self.settings.deepseek_api_key
-            else NullLLMClient()
-        )
+        self.llm_client = llm_client or create_llm_client(self.settings)
 
     def answer(
         self,
@@ -70,7 +70,7 @@ class QASystem:
         try:
             answer = str(self.llm_client.chat(messages, temperature=0.0))
         except Exception as exc:
-            answer = f"{classify_error(exc, 'DeepSeek 问答')}\n\n已返回本地检索来源，请人工核对。"
+            answer = f"{classify_error(exc, '大模型问答')}\n\n已返回本地检索来源，请人工核对。"
         self._save_history(question, answer, results)
         return {"answer": answer, "sources": results}
 

@@ -425,7 +425,7 @@ class ImportJobManager:
         try:
             file_hash = calculate_file_md5(file_path)
             info = get_file_info(file_path)
-            target_profile = build_index_profile(self.settings)
+            target_profile = build_index_profile(self.settings, info.file_type)
         except Exception as exc:
             self._upsert_error_file(job_id, resolved, exc)
             return
@@ -868,8 +868,8 @@ def classify_error(exc: Exception, phase: str = "") -> str:
     """Return a user-facing error category and action hint."""
     text = str(exc)
     lowered = text.lower()
-    if any(key in lowered for key in ("api key", "unauthorized", "401", "invalid token", "deepseek")):
-        return f"DeepSeek token 或鉴权错误：{text}"
+    if any(key in lowered for key in ("api key", "unauthorized", "401", "403", "invalid token", "deepseek", "crs")):
+        return f"大模型 API token 或鉴权错误：{text}"
     if any(key in lowered for key in ("timeout", "connection", "connect", "network", "503", "502", "504")):
         return f"服务器连接或响应失败：{text}"
     if "ocr" in lowered or "paddle" in lowered:
