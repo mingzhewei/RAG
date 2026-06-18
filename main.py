@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 from sensor_vector_db.config.settings import get_settings
+from sensor_vector_db.core.import_jobs import request_stop_all_running_jobs
 from sensor_vector_db.models.database import init_database
 from sensor_vector_db.utils.logger import configure_logging, get_logger
 
@@ -48,13 +49,34 @@ def build_streamlit_command(
     return command
 
 
-def run_streamlit(command: list[str]) -> int:
+def run_streamlit(command: list[str], settings=None) -> int:
     """Run Streamlit and return its process exit code."""
+    process = subprocess.Popen(command)
     try:
-        completed = subprocess.run(command, check=False)
+        return int(process.wait())
     except KeyboardInterrupt:
+        request_stop_all_running_jobs(settings)
+        _terminate_process_tree(process)
         return 130
-    return int(completed.returncode)
+
+
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    """Terminate the Streamlit child process and its descendants."""
+    if process.poll() is not None:
+        return
+    if sys.platform.startswith("win"):
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
 
 
 def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[str]]:
@@ -87,7 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     print("Starting Streamlit UI...")
     print("Command: " + " ".join(command))
-    return run_streamlit(command)
+    return run_streamlit(command, settings)
 
 
 if __name__ == "__main__":

@@ -34,10 +34,12 @@ def test_main_starts_streamlit_with_launcher_options(monkeypatch) -> None:
     """The default mode should start Streamlit and pass through options."""
     launcher = importlib.import_module("main")
     captured: dict[str, list[str]] = {}
-    monkeypatch.setattr(launcher, "initialize_runtime", lambda: DummySettings())
+    settings = DummySettings()
+    monkeypatch.setattr(launcher, "initialize_runtime", lambda: settings)
 
-    def fake_run_streamlit(command: list[str]) -> int:
+    def fake_run_streamlit(command: list[str], settings=None) -> int:
         captured["command"] = command
+        captured["settings"] = settings
         return 7
 
     monkeypatch.setattr(launcher, "run_streamlit", fake_run_streamlit)
@@ -49,3 +51,35 @@ def test_main_starts_streamlit_with_launcher_options(monkeypatch) -> None:
     assert "ui/app.py" in command[4].replace("\\", "/")
     assert "--server.port=8502" in command
     assert "--server.headless=true" in command
+    assert captured["settings"] is settings
+
+
+def test_run_streamlit_interrupt_stops_imports_and_child(monkeypatch) -> None:
+    """Ctrl+C should request import shutdown and terminate the Streamlit child."""
+    launcher = importlib.import_module("main")
+    calls = []
+
+    class FakeProcess:
+        pid = 12345
+
+        def wait(self):
+            raise KeyboardInterrupt
+
+        def poll(self):
+            return None
+
+    process = FakeProcess()
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda command: process)
+    monkeypatch.setattr(
+        launcher,
+        "request_stop_all_running_jobs",
+        lambda settings=None: calls.append(("stop_imports", settings)),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_terminate_process_tree",
+        lambda child: calls.append(("terminate", child)),
+    )
+
+    assert launcher.run_streamlit(["streamlit"]) == 130
+    assert calls == [("stop_imports", None), ("terminate", process)]

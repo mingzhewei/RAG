@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from bootstrap import configure_page, get_document_manager, get_import_job_manager
+from components.safe_dataframe import render_dataframe
 
 import pandas as pd
 import streamlit as st
@@ -111,7 +112,7 @@ def _render_import_job(job_id: str) -> None:
     st.subheader("最近事件")
     events = job_manager.get_events(job.id, limit=120)
     if events:
-        st.dataframe(pd.DataFrame(events), width="stretch", hide_index=True, height=260)
+        render_dataframe(pd.DataFrame(events), width="stretch", hide_index=True, height=260)
     else:
         st.info("暂无事件。")
 
@@ -127,7 +128,7 @@ def _render_import_job(job_id: str) -> None:
         filtered = [
             row for row in file_rows if not status_filter or row["status"] in status_filter
         ]
-        st.dataframe(pd.DataFrame(filtered), width="stretch", hide_index=True, height=320)
+        render_dataframe(pd.DataFrame(filtered), width="stretch", hide_index=True, height=320)
     else:
         st.info("任务尚未生成文件计划。")
 
@@ -157,7 +158,7 @@ def _render_imported_documents() -> None:
         }
         for document in documents
     ]
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, height=320)
+    render_dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, height=320)
 
 
 if job:

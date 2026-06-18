@@ -10,7 +10,7 @@ from pathlib import Path
 import threading
 from typing import Any
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, update
 
 from sensor_vector_db.config.settings import Settings, get_settings
 from sensor_vector_db.core.document_manager import DocumentManager
@@ -33,8 +33,18 @@ from sensor_vector_db.utils.logger import get_logger
 logger = get_logger(__name__)
 _RUNNING_THREADS: dict[str, threading.Thread] = {}
 _STOP_EVENTS: dict[str, threading.Event] = {}
+_JOB_SETTINGS: dict[str, Settings] = {}
 _THREAD_LOCK = threading.Lock()
 RETRYABLE_FILE_STATUSES = {"pending", "processing", "failed"}
+STOP_REQUESTED_STATUS = "stopping"
+RUNNING_OR_STOPPING_STATUSES = {"running", STOP_REQUESTED_STATUS}
+RESUMABLE_JOB_STATUSES = {
+    "queued",
+    "running",
+    "interrupted",
+    "failed",
+    "completed_with_errors",
+}
 
 
 class ImportCancelled(OperationCancelled):
@@ -87,13 +97,7 @@ class ImportJobSnapshot:
     @property
     def can_resume(self) -> bool:
         """Return whether this job can be resumed by the UI."""
-        return self.status in {
-            "queued",
-            "running",
-            "interrupted",
-            "failed",
-            "completed_with_errors",
-        } and not self.is_thread_active
+        return self.status in RESUMABLE_JOB_STATUSES and not self.is_thread_active
 
 
 class ImportJobManager:
@@ -150,6 +154,7 @@ class ImportJobManager:
             )
             _STOP_EVENTS[job_id] = stop_event
             _RUNNING_THREADS[job_id] = new_thread
+            _JOB_SETTINGS[job_id] = self.settings
             new_thread.start()
 
     def request_stop(self, job_id: str) -> None:
@@ -158,6 +163,7 @@ class ImportJobManager:
             stop_event = _STOP_EVENTS.get(job_id)
             if stop_event:
                 stop_event.set()
+        _persist_stop_request(self.settings, [job_id])
 
     def request_stop_all(self) -> None:
         """Ask all running import jobs to stop at the next safe checkpoint."""
@@ -174,7 +180,7 @@ class ImportJobManager:
 
         with session_scope(self.settings) as session:
             jobs = session.execute(
-                select(ImportJob).where(ImportJob.status == "running")
+                select(ImportJob).where(ImportJob.status.in_(RUNNING_OR_STOPPING_STATUSES))
             ).scalars().all()
             for job in jobs:
                 if job.id in active_job_ids:
@@ -280,12 +286,12 @@ class ImportJobManager:
         try:
             source_path = self._mark_started(job_id)
             manager = DocumentManager(self.settings)
-            self._raise_if_cancelled(stop_event)
+            self._raise_if_cancelled(job_id, stop_event)
             self._prepare_plan(job_id, source_path, manager)
             pending_files = self._get_retryable_files(job_id)
 
             for sequence, file_row_id in enumerate(pending_files, start=1):
-                self._raise_if_cancelled(stop_event)
+                self._raise_if_cancelled(job_id, stop_event)
                 self._process_one_file(
                     job_id,
                     file_row_id,
@@ -317,6 +323,7 @@ class ImportJobManager:
             with _THREAD_LOCK:
                 _RUNNING_THREADS.pop(job_id, None)
                 _STOP_EVENTS.pop(job_id, None)
+                _JOB_SETTINGS.pop(job_id, None)
 
     def _prepare_plan(self, job_id: str, source_path: str, manager: DocumentManager) -> None:
         """Scan source path, plan retries/skips, and remove deleted documents."""
@@ -372,7 +379,7 @@ class ImportJobManager:
         stop_event: threading.Event,
     ) -> None:
         """Process one planned file and persist its final state."""
-        self._raise_if_cancelled(stop_event)
+        self._raise_if_cancelled(job_id, stop_event)
         with session_scope(self.settings) as session:
             row = session.get(ImportJobFile, file_row_id)
             if not row:
@@ -393,14 +400,14 @@ class ImportJobManager:
             level: str = "info",
         ) -> None:
             del current, total
-            self._raise_if_cancelled(stop_event)
+            self._raise_if_cancelled(job_id, stop_event)
             self._update_file_progress(job_id, file_row_id, path, phase, message, level)
 
         try:
             status = manager.import_file(
                 file_path,
                 progress_callback=progress,
-                cancel_callback=lambda: self._raise_if_cancelled(stop_event),
+                cancel_callback=lambda: self._raise_if_cancelled(job_id, stop_event),
                 current_index=sequence,
                 total_files=total_pending,
             )
@@ -413,11 +420,16 @@ class ImportJobManager:
         finally:
             self._update_counts(job_id)
 
-    @staticmethod
-    def _raise_if_cancelled(stop_event: threading.Event) -> None:
+    def _raise_if_cancelled(self, job_id: str, stop_event: threading.Event) -> None:
         """Raise when a running job has been asked to stop."""
-        if stop_event.is_set():
+        if stop_event.is_set() or self._is_stop_requested(job_id):
             raise ImportCancelled("Import job was cancelled.")
+
+    def _is_stop_requested(self, job_id: str) -> bool:
+        """Return whether this job has a persisted stop request."""
+        with session_scope(self.settings) as session:
+            job = session.get(ImportJob, job_id)
+            return bool(job and job.status == STOP_REQUESTED_STATUS)
 
     def _upsert_file_plan(self, job_id: str, file_path: Path) -> None:
         """Create or update one file row based on current hash and document state."""
@@ -567,21 +579,32 @@ class ImportJobManager:
             job = session.get(ImportJob, job_id)
             if not job:
                 raise ValueError(f"Import job not found: {job_id}")
-            job.status = "running"
-            job.phase = "启动"
-            job.message = "后台导入线程已启动"
-            job.started_at = job.started_at or utc_now()
-            job.finished_at = None
-            job.updated_at = utc_now()
+            source_path = job.source_path
+            now = utc_now()
+            session.execute(
+                update(ImportJob)
+                .where(
+                    ImportJob.id == job_id,
+                    ImportJob.status != STOP_REQUESTED_STATUS,
+                )
+                .values(
+                    status="running",
+                    phase="启动",
+                    message="后台导入线程已启动",
+                    started_at=job.started_at or now,
+                    finished_at=None,
+                    updated_at=now,
+                )
+            )
             session.add(
                 ImportJobEvent(
                     job_id=job_id,
                     phase="启动",
                     message="后台导入线程已启动或已恢复",
-                    file_path=job.source_path,
+                    file_path=source_path,
                 )
             )
-            return job.source_path
+            return source_path
 
     def _update_file_progress(
         self,
@@ -597,7 +620,6 @@ class ImportJobManager:
             job = session.get(ImportJob, job_id)
             row = session.get(ImportJobFile, file_row_id)
             if job:
-                job.status = "running"
                 job.phase = phase
                 job.message = message
                 job.current_file = file_path
@@ -739,7 +761,6 @@ class ImportJobManager:
             job = session.get(ImportJob, job_id)
             if not job:
                 return
-            job.status = "running"
             job.phase = phase
             job.message = message
             job.current_file = file_path
@@ -822,7 +843,7 @@ class ImportJobManager:
                 .where(
                     ImportJob.source_path == source_path,
                     ImportJob.status.in_(
-                        {"queued", "running", "interrupted", "failed", "completed_with_errors"}
+                        RESUMABLE_JOB_STATUSES
                     ),
                 )
                 .order_by(desc(ImportJob.created_at))
@@ -903,11 +924,65 @@ def _is_under_root(file_path: str, root: str) -> bool:
         return False
 
 
-def request_stop_all_running_jobs() -> None:
+def _persist_stop_request(
+    settings: Settings | None = None,
+    job_ids: list[str] | None = None,
+) -> None:
+    """Persist stop requests so workers in other UI sessions can observe them."""
+    try:
+        runtime_settings = settings or get_settings()
+        init_database(runtime_settings)
+        with session_scope(runtime_settings) as session:
+            statement = select(ImportJob)
+            if job_ids is None:
+                statement = statement.where(ImportJob.status == "running")
+            else:
+                statement = statement.where(
+                    ImportJob.id.in_(job_ids),
+                    ImportJob.status.in_(RUNNING_OR_STOPPING_STATUSES),
+                )
+            jobs = session.execute(statement).scalars().all()
+            now = utc_now()
+            for job in jobs:
+                if job.status != STOP_REQUESTED_STATUS:
+                    job.status = STOP_REQUESTED_STATUS
+                    job.phase = "停止请求"
+                    job.message = "已收到停止请求，当前批次完成后会中断，可稍后恢复。"
+                    job.updated_at = now
+                    session.add(
+                        ImportJobEvent(
+                            job_id=job.id,
+                            level="warning",
+                            phase="停止请求",
+                            message="已收到停止请求，当前批次完成后会中断，可稍后恢复。",
+                            file_path=job.current_file,
+                        )
+                    )
+    except Exception as exc:  # pragma: no cover - best-effort shutdown path
+        logger.warning("Failed to persist import stop request: %s", exc)
+
+
+def request_stop_all_running_jobs(settings: Settings | None = None) -> None:
     """Ask all import worker threads to stop without blocking interpreter shutdown."""
     with _THREAD_LOCK:
+        job_ids = list(_STOP_EVENTS)
+        job_settings = {job_id: _JOB_SETTINGS.get(job_id) for job_id in job_ids}
         for stop_event in _STOP_EVENTS.values():
             stop_event.set()
+    if settings is not None:
+        _persist_stop_request(settings)
+        return
+    for job_id, job_settings_item in job_settings.items():
+        if job_settings_item is not None:
+            _persist_stop_request(job_settings_item, [job_id])
 
 
-atexit.register(request_stop_all_running_jobs)
+def _request_stop_all_at_exit() -> None:
+    """Stop local worker threads at interpreter exit without touching unrelated jobs."""
+    with _THREAD_LOCK:
+        has_local_workers = bool(_STOP_EVENTS)
+    if has_local_workers:
+        request_stop_all_running_jobs()
+
+
+atexit.register(_request_stop_all_at_exit)
