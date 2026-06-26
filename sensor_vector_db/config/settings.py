@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     ocr_max_pages_per_file: int = Field(default=20)
     ocr_render_scale: float = Field(default=1.5)
 
+    # PDF parsing: how many pages to parse before writing an incremental checkpoint.
+    # Set to 0 to disable batching (parse all pages before writing).
+    pdf_page_batch_size: int = Field(default=50)
+    # When True, fall back to pymupdf (fitz) if pdfplumber fails to open a file.
+    pdf_pymupdf_fallback: bool = Field(default=True)
+
     chroma_path: Path = Field(default=Path("data/chroma"))
     chroma_collection: str = Field(default="sensor_documents")
     sqlite_path: Path = Field(default=Path("data/sensor_rag.db"))
@@ -115,7 +121,7 @@ class Settings(BaseSettings):
             raise ValueError("Timeout settings must be positive.")
         return value
 
-    @field_validator("ocr_min_text_chars", "ocr_max_pages_per_file", "native_thread_limit")
+    @field_validator("ocr_min_text_chars", "ocr_max_pages_per_file", "native_thread_limit", "pdf_page_batch_size")
     @classmethod
     def _validate_non_negative_integer(cls, value: int) -> int:
         """Validate non-negative numeric runtime settings."""

@@ -1,85 +1,144 @@
-# 本地传感器 RAG 检索 MVP
+# 本地传感器文档智能助手
 
-这是一个本地运行的传感器技术文档 RAG 检索系统。系统以本地向量库为核心，支持 PDF、DOCX、受控文本和代码文件导入，扫描 PDF 可启用 PaddleOCR，本地 embedding 默认使用 `BAAI/bge-m3`，问答生成默认通过 CRS OpenAI-compatible 接口完成，也可切换到 DeepSeek 或关闭大模型调用。
+基于本地向量数据库的传感器技术文档 RAG（检索增强生成）系统。支持 PDF、Word、文本文档和代码文件的导入，通过混合检索（语义 + 关键词）找到相关内容，由大模型基于文档证据生成回答。
 
-## 运行
+## 快速启动
 
 ```powershell
+# 1. 安装依赖
 .\.venv\Scripts\python -m pip install -r requirements.txt
+
+# 2. 配置环境
 Copy-Item .env.example .env
+# 编辑 .env，填入你的大模型 API Key
+
+# 3. 启动
 .\.venv\Scripts\python main.py
 ```
 
-`main.py` 会初始化本地 SQLite/Chroma 目录并自动启动 Streamlit 界面。只检查环境、不启动界面时使用：
+只检查环境、不启动界面：
 
 ```powershell
 .\.venv\Scripts\python main.py --check
 ```
 
-如果默认端口被占用，可以指定端口：
+指定端口：
 
 ```powershell
 .\.venv\Scripts\python main.py --port 8502
 ```
 
-大模型密钥只写入 `.env` 或在 Streamlit 系统管理页临时输入，不要提交到 Git。默认配置为 `LLM_PROVIDER=crs`、`WIRE_API=responses`、`CRS=gpt-5.5`；需要切回 DeepSeek 时把 `LLM_PROVIDER=deepseek`，需要完全禁用生成时设为 `LLM_PROVIDER=none`。
+## 页面功能
 
-## 轻量测试
+### 首页 — 智能搜索
 
-测试默认使用 deterministic fake embedding，不会下载 BGE-M3，也不会调用外部大模型。
+统一搜索入口，输入问题即可获取 AI 回答。支持：
+
+- 自然语言提问，AI 基于已导入的文档回答
+- 对话历史，可连续追问
+- 参考来源展示，每个回答附带文档出处
+- 关键词高亮
+- 快捷示例按钮
+
+侧边栏包含系统状态（文档数、片段数、向量数）和功能导航。高级设置（检索片段数、检索策略）默认折叠。
+
+### 文档导入
+
+将传感器技术文档导入本地向量数据库：
+
+- 支持 PDF、Word (.docx)、文本 (.txt/.md) 和代码文件
+- 自动识别新增、修改和已删除文件
+- 哈希去重：相同内容的文件只索引一次
+- 断点续传：中断后可恢复，已完成的文件自动跳过
+- 实时进度展示和文件明细
+
+### 智能检索
+
+直接搜索文档内容，查看原始匹配片段。支持：
+
+- 三种检索模式：混合检索（推荐）、语义检索、关键词检索
+- 按文件类型、传感器型号、制造商筛选
+- 结果按相关度排序，含来源文件和页码
+
+### 智能问答
+
+多轮对话式问答，使用 Streamlit 原生聊天组件。AI 会基于已导入的文档回答，每条结论标注来源编号。
+
+### 参数抽取
+
+从已入库文档中自动抽取传感器技术参数（量程、精度、分辨率、工作温度等），支持 LLM 校验字段名。
+
+### 参数对比
+
+选择 2-5 个传感器型号，生成跨型号参数对比表格，可导出 Markdown 或 CSV。
+
+### 系统管理
+
+- 查看系统状态和存储位置
+- 切换大模型配置（CRS / DeepSeek / 禁用）
+- 刷新文档元数据（型号、厂商识别）
+- 查看嵌入模型、OCR 等处理参数
+
+## 大模型配置
+
+密钥写入 `.env` 文件，或在系统管理页面临时输入。默认配置：
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `LLM_PROVIDER` | `crs` | 提供方：`crs`、`deepseek`、`none` |
+| `WIRE_API` | `responses` | API 协议：`responses` 或 `chat_completions` |
+| `CRS` | `gpt-5.5` | CRS 模型名 |
+
+切换到 DeepSeek 时设置 `LLM_PROVIDER=deepseek`，禁用生成时设为 `LLM_PROVIDER=none`。
+
+## 运行测试
+
+测试使用确定性 fake embedding，不需要下载 BGE-M3 模型或调用外部 API：
 
 ```powershell
 .\.venv\Scripts\pytest
 ```
 
-## 准确性原则
-
-- 回答必须基于检索片段。
-- 参数值必须保留来源文本、页码或 chunk 信息。
-- 未找到依据时显示“未在已入库文档中找到依据”，不推断、不补全。
-
 ## 导入范围
 
-- `.txt` 仅导入不大于 1 MiB（1,048,576 bytes）的文件；大于该阈值的 TXT 会被扫描阶段排除。
-- CSV 文件一律排除，不作为 RAG 证据文本入库。
-- PCAP 抓包文件以及音频、视频文件一律排除，不作为 RAG 证据文本入库。
-- 数据库相关文件一律排除，包括 `.db`、`.sqlite`、`.sqlite3`、`.sqlite-wal`、`.sqlite-shm`、`.sql`、`.ddl`、`.dml`、`.dump`、`.bak`，以及 Chroma 运行库目录内的文件。
+- `.txt` 仅导入不大于 1 MiB 的文件
+- CSV、PCAP、音视频、数据库文件一律排除
 
 ## 持久导入
 
-- 文档导入页使用持久任务表记录目录同步进度。
-- 同一目录再次同步时会按文件哈希识别新增、修改和未变化文件。
-- 源目录中删除的文件会在下一次同步时清理对应 SQLite 元数据和 Chroma 向量。
-- 如果关机或服务重启导致任务中断，回到文档导入页选择任务并点击“恢复该任务”即可继续处理未完成或失败文件；已完成文件会跳过。
-- 单个文件已完成解析/分块并写入 SQLite checkpoint 后，如果退出发生在向量化或写 Chroma 阶段，下次会只补齐缺失 chunk 向量；如果退出早于这个 checkpoint，则该文件会重新解析处理。
-- 文件级明细会显示成功、跳过、失败、当前阶段和错误原因。
-- 点击“停止该任务”或在启动器中按 `Ctrl+C` 时，停止请求会先写入 SQLite；当前 OCR 或 embedding batch 可能需要完成后才会中断。中断不会删除 SQLite/Chroma 中已经完成的文档和向量，正在处理的文件会回到待处理队列，后续可恢复。
+- 文档导入页使用持久任务表记录目录同步进度
+- 同一目录再次同步时按文件哈希识别新增、修改和未变化文件
+- 源目录删除的文件会在下次同步时清理对应元数据和向量
+- 关机或服务重启导致任务中断后，回到文档导入页选择任务并点击"恢复任务"即可继续
+- 单文件 checkpoint 机制保证向量化中断后只补齐缺失向量，不重新解析
+- 点击"停止任务"或 `Ctrl+C` 时，停止请求先写入 SQLite，当前批次完成后中断
 
-### 导入/恢复使用流程
+## 导入加速建议
 
-1. 将待入库资料放在本地目录中，例如 `sensor/`。
-2. 打开 Streamlit 的“文档导入”页，输入本地文件或文件夹路径，点击“开始/继续同步”。
-3. 需要暂停时点击“停止该任务”；任务会在下一个安全检查点退出。
-4. 如果浏览器关闭、服务重启或电脑关机，重新启动项目后回到“文档导入”页，选择原任务并点击“恢复该任务”。
-5. 查看“文件明细”确认每个文件的状态；`skipped` 表示文件未变化或已复用已有向量，`processing`/`pending` 表示仍需继续。
+- 默认关闭 OCR：`OCR_ENABLED=false`。先导入可复制文本的 PDF
+- 文字版入库后，设置 `OCR_ENABLED=true` 再恢复导入，自动重建需要 OCR 的文件
+- `EMBEDDING_DEVICE=cuda` + `EMBEDDING_USE_FP16=true` 可利用 GPU 加速向量化
+- `CHUNK_SIZE` 调大减少向量数量但降低检索粒度
 
-## 导入加速
+## 项目结构
 
-- 默认先不做 OCR：`OCR_ENABLED=false`。PDF 会先尽量抽取可复制文本、表格并完成向量化。
-- 文字版资料入库完成后，可以把 `.env` 改成 `OCR_ENABLED=true` 再恢复导入；程序会识别 text-only 索引无法满足 OCR 目标，并重建需要 OCR 的文件。
-- 重建时会先写入临时 `indexing` 状态和 SQLite chunk checkpoint，只有 SQLite 元数据和 Chroma 向量都写成功后才标记为 `imported`，避免半成品污染检索。
-- 恢复 `indexing` 文件时会先检查 Chroma 中已存在的 chunk id，只对缺失 chunk 重新 embedding 并写入向量库。
-- 默认每个 PDF 最多 OCR 20 页，防止长扫描件拖垮内存和磁盘；`OCR_MAX_PAGES_PER_FILE=0` 表示不限制。
-- `OCR_RENDER_SCALE=1.5` 会降低 OCR 渲染图片尺寸，通常比 `2.0` 更省内存和 SSD 写入。
-- BGE embedding 在 CPU 上会很慢。有可用 NVIDIA GPU 时，可尝试 `EMBEDDING_DEVICE=cuda` 和 `EMBEDDING_USE_FP16=true`。
-- `EMBEDDING_BATCH_SIZE` 调大可能更快，但会增加内存压力；机器已经卡顿时不要盲目调大。
-- `CHUNK_SIZE` 调大可以减少向量数量、加快导入，但检索粒度会变粗。
-- 默认 `NATIVE_THREAD_LIMIT=4`，限制 Paddle/torch/numpy 这类底层库吃满 CPU；`0` 表示不限制。
+```
+sensor_vector_db/
+  config/      配置管理（Settings）
+  core/        文档解析、向量化、检索、问答、参数抽取
+  models/      SQLite 数据模型
+  utils/       日志、文件工具、哈希工具
+ui/
+  app.py       首页（智能搜索入口）
+  bootstrap.py 服务缓存和配置桥接
+  components/  渲染组件
+  pages/       功能页面（文档导入、检索、问答、参数抽取/对比、系统管理）
+tests/         单元测试和集成测试
+main.py        启动入口
+```
 
-## 主要目录
+## 准确性原则
 
-- `sensor_vector_db/config`：配置管理。
-- `sensor_vector_db/core`：解析、向量化、检索、问答、参数抽取。
-- `sensor_vector_db/models`：SQLite 元数据模型。
-- `ui`：Streamlit Web 应用。
-- `tests`：单元测试和轻量集成测试。
+- 回答必须严格基于检索到的文档片段
+- 参数值保留来源文本、页码信息
+- 未找到依据时显示"未在已入库文档中找到依据"，不推断、不补全

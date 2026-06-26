@@ -1,10 +1,19 @@
-"""Embedding providers for local semantic search."""
+"""Embedding providers for local semantic search.
+
+Singleton design:
+    The BGE-M3 model is large (~2 GB GPU memory).  When an import job and
+    a search request both need embeddings, we reuse the *same* model
+    instance so that GPU memory is claimed only once and embedding calls
+    naturally serialize (no concurrent GPU kernel launches).
+"""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from hashlib import blake2b
 import math
+import os
+import threading
 
 import numpy as np
 
@@ -13,6 +22,10 @@ from sensor_vector_db.utils.logger import get_logger
 
 
 logger = get_logger(__name__)
+
+# ---- singleton cache (module-private) ----
+_singleton_lock = threading.Lock()
+_singleton_instance: "BGEEmbedding | None" = None
 
 
 class BaseEmbedding(ABC):
@@ -62,30 +75,46 @@ class BGEEmbedding(BaseEmbedding):
         self._model = None
 
     def _load_model(self):
-        """Load BGE-M3 model lazily."""
+        """Load BGE-M3 model lazily with offline fallback.
+
+        Tries to load the model from the local HuggingFace cache first
+        (offline mode).  If that fails because the model has not been
+        downloaded yet, retries with network access enabled so the
+        download can happen.
+        """
         if self._model is not None:
             return self._model
-        try:
-            from FlagEmbedding import BGEM3FlagModel
-        except ImportError as exc:
-            raise RuntimeError(
-                "FlagEmbedding is not installed. Install requirements.txt "
-                "or set EMBEDDING_BACKEND=fake for smoke tests."
-            ) from exc
 
-        logger.info("Loading embedding model %s", self.settings.embedding_model)
-        try:
-            self._model = BGEM3FlagModel(
-                self.settings.embedding_model,
-                use_fp16=self.settings.embedding_use_fp16,
-                device=self.settings.embedding_device,
-            )
-        except TypeError:
-            self._model = BGEM3FlagModel(
-                self.settings.embedding_model,
-                use_fp16=self.settings.embedding_use_fp16,
-            )
-        return self._model
+        model_name = self.settings.embedding_model
+        logger.info("Loading embedding model %s (offline-first)", model_name)
+
+        # Try offline first — the model is normally cached after a
+        # successful download and should not require network access.
+        for attempt in (1, 2):
+            offline = attempt == 1
+            if offline:
+                os.environ["HF_HUB_OFFLINE"] = "1"
+                os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            else:
+                os.environ.pop("HF_HUB_OFFLINE", None)
+                os.environ.pop("TRANSFORMERS_OFFLINE", None)
+                logger.warning("离线加载失败，尝试从 HuggingFace 下载模型（需要网络）")
+
+            try:
+                self._model = _create_bge_model(model_name, self.settings)
+                return self._model
+            except Exception as exc:
+                if offline:
+                    logger.debug("离线模式加载失败: %s", exc)
+                else:
+                    raise RuntimeError(
+                        f"无法加载嵌入模型 {model_name}。\n"
+                        f"离线模式已尝试但模型缓存不完整。\n"
+                        f"在线下载也失败了，请检查网络连接。\n"
+                        f"原始错误: {exc}"
+                    ) from exc
+
+        raise RuntimeError(f"无法加载嵌入模型 {model_name}")
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Embed text strings with BGE-M3 dense vectors."""
@@ -104,12 +133,57 @@ class BGEEmbedding(BaseEmbedding):
         return _normalize_vectors(dense)
 
 
+def _create_bge_model(model_name: str, settings: Settings):
+    """Create a BGEM3FlagModel instance (module-level to satisfy linter)."""
+    try:
+        from FlagEmbedding import BGEM3FlagModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "FlagEmbedding is not installed. Install requirements.txt "
+            "or set EMBEDDING_BACKEND=fake for smoke tests."
+        ) from exc
+
+    try:
+        return BGEM3FlagModel(
+            model_name,
+            use_fp16=settings.embedding_use_fp16,
+            device=settings.embedding_device,
+        )
+    except TypeError:
+        return BGEM3FlagModel(
+            model_name,
+            use_fp16=settings.embedding_use_fp16,
+        )
+
+
 def create_embedding_provider(settings: Settings | None = None) -> BaseEmbedding:
-    """Create the configured embedding provider."""
+    """Create the configured embedding provider.
+
+    For the BGE backend, a **module-level singleton** is returned so that
+    import workers and search requests share the same loaded model.  This
+    avoids double GPU-memory usage and keeps embedding calls serialised.
+    """
     runtime_settings = settings or get_settings()
     if runtime_settings.embedding_backend.lower() == "fake":
         return DeterministicEmbedding(runtime_settings.embedding_dimension)
-    return BGEEmbedding(runtime_settings)
+
+    global _singleton_instance
+    if _singleton_instance is not None:
+        return _singleton_instance
+
+    with _singleton_lock:
+        if _singleton_instance is not None:
+            return _singleton_instance
+        _singleton_instance = BGEEmbedding(runtime_settings)
+        logger.info("Embedding model singleton created (shared by import and search)")
+        return _singleton_instance
+
+
+def _reset_singleton_for_tests() -> None:
+    """Expose a test-only reset hook (not part of the public API)."""
+    global _singleton_instance
+    with _singleton_lock:
+        _singleton_instance = None
 
 
 def _normalize_vectors(vectors) -> list[list[float]]:

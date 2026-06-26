@@ -119,7 +119,17 @@ class OCRClient:
 
 
 class PDFParser(BaseDocumentParser):
-    """Parse PDF text and tables with optional OCR fallback."""
+    """Parse PDF text and tables with optional OCR fallback.
+
+    For large files the pages are processed in configurable batches
+    (``pdf_page_batch_size``). Each batch yields its segments immediately
+    so the caller can write incremental checkpoints without holding the
+    entire document in memory.
+
+    When pdfplumber cannot open a file (corrupt, unusual structure, etc.)
+    the parser optionally retries with pymupdf (fitz) when
+    ``pdf_pymupdf_fallback`` is True.
+    """
 
     def __init__(self, settings: Settings | None = None) -> None:
         """Initialize PDF parser."""
@@ -131,25 +141,65 @@ class PDFParser(BaseDocumentParser):
         path: str | Path,
         cancel_callback: CancelCallback | None = None,
     ) -> list[ParsedSegment]:
-        """Parse PDF pages into text, table, and OCR segments."""
+        """Parse PDF pages into text, table, and OCR segments.
+
+        Internally delegates to :meth:`iter_page_batches` and collects all
+        segments into a single list for callers that prefer the simple API.
+        """
+        segments: list[ParsedSegment] = []
+        for batch in self.iter_page_batches(path, cancel_callback=cancel_callback):
+            segments.extend(batch)
+        return segments
+
+    def iter_page_batches(
+        self,
+        path: str | Path,
+        cancel_callback: CancelCallback | None = None,
+    ):
+        """Yield successive lists of ParsedSegment, one list per page batch.
+
+        ``pdf_page_batch_size`` controls how many PDF pages are parsed per
+        batch. A value of 0 (or negative) collects all pages into one batch,
+        which preserves the previous behaviour.
+
+        Yields
+        ------
+        list[ParsedSegment]
+            Segments extracted from the current batch of pages.
+        """
         _check_cancelled(cancel_callback)
         file_path = Path(path)
-        segments: list[ParsedSegment] = []
         try:
             import pdfplumber
         except ImportError as exc:
             raise RuntimeError("pdfplumber is required to parse PDF files.") from exc
 
+        batch_size = self.settings.pdf_page_batch_size if self.settings.pdf_page_batch_size > 0 else 0
+
         try:
-            with pdfplumber.open(file_path) as pdf:
+            pdf_context = pdfplumber.open(file_path)
+        except Exception as open_exc:  # noqa: BLE001
+            if self.settings.pdf_pymupdf_fallback:
+                logger.warning(
+                    "pdfplumber failed to open %s (%s); retrying with pymupdf.",
+                    file_path,
+                    open_exc,
+                )
+                yield from self._iter_batches_pymupdf(file_path, batch_size, cancel_callback)
+                return
+            raise RuntimeError(f"Failed to parse PDF {file_path}: {open_exc}") from open_exc
+
+        try:
+            with pdf_context as pdf:
                 pdfium_document: Any | None = None
                 ocr_pages_used = 0
+                batch: list[ParsedSegment] = []
                 try:
                     for page_number, page in enumerate(pdf.pages, start=1):
                         _check_cancelled(cancel_callback)
                         text = page.extract_text() or ""
                         if text.strip():
-                            segments.append(
+                            batch.append(
                                 ParsedSegment(
                                     content=text.strip(),
                                     content_type="text",
@@ -160,7 +210,7 @@ class PDFParser(BaseDocumentParser):
                         for table in page.extract_tables() or []:
                             table_text = _table_to_markdown(table)
                             if table_text.strip():
-                                segments.append(
+                                batch.append(
                                     ParsedSegment(
                                         content=table_text,
                                         content_type="table",
@@ -176,20 +226,81 @@ class PDFParser(BaseDocumentParser):
                             ocr_text = self._ocr_pdf_page(pdfium_document, file_path, page_number - 1)
                             _check_cancelled(cancel_callback)
                             if ocr_text.strip():
-                                segments.append(
+                                batch.append(
                                     ParsedSegment(
                                         content=ocr_text.strip(),
                                         content_type="ocr",
                                         page_number=page_number,
                                     )
                                 )
+
+                        if batch_size > 0 and page_number % batch_size == 0:
+                            yield batch
+                            batch = []
+
+                    if batch:
+                        yield batch
                 finally:
                     self._close_pdfium_document(pdfium_document)
-            return segments
         except OperationCancelled:
             raise
         except Exception as exc:
             raise RuntimeError(f"Failed to parse PDF {file_path}: {exc}") from exc
+
+    def _iter_batches_pymupdf(
+        self,
+        file_path: Path,
+        batch_size: int,
+        cancel_callback: CancelCallback | None,
+    ):
+        """Yield ParsedSegment batches using pymupdf as a fallback parser."""
+        try:
+            import fitz  # pymupdf
+        except ImportError as exc:
+            raise RuntimeError(
+                "pymupdf (fitz) is not installed. "
+                "Run `pip install pymupdf` to enable the PDF fallback parser."
+            ) from exc
+
+        # On Windows, fitz.open(str(path)) fails for non-ASCII paths.
+        # Read the file bytes and open from a memory stream instead.
+        try:
+            pdf_bytes = file_path.read_bytes()
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to parse PDF {file_path} with pymupdf: {exc}"
+            ) from exc
+
+        try:
+            batch: list[ParsedSegment] = []
+            for page_number in range(1, len(doc) + 1):
+                _check_cancelled(cancel_callback)
+                page = doc[page_number - 1]
+                text = page.get_text("text") or ""
+                if text.strip():
+                    batch.append(
+                        ParsedSegment(
+                            content=text.strip(),
+                            content_type="text",
+                            page_number=page_number,
+                        )
+                    )
+
+                if batch_size > 0 and page_number % batch_size == 0:
+                    yield batch
+                    batch = []
+
+            if batch:
+                yield batch
+        except OperationCancelled:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to parse PDF {file_path} with pymupdf: {exc}"
+            ) from exc
+        finally:
+            doc.close()
 
     def _should_ocr_page(self, text: str, ocr_pages_used: int = 0) -> bool:
         """Return whether a PDF page should be sent to OCR."""

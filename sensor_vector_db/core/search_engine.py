@@ -47,6 +47,7 @@ class SearchEngine:
         if not clean_query:
             return []
         limit = top_k or self.settings.search_top_k
+        self._warn_if_import_active()
         mode = mode.lower()
         if mode == "semantic":
             return self.semantic_search(clean_query, limit, filters)
@@ -54,16 +55,48 @@ class SearchEngine:
             return self.keyword_search(clean_query, limit, filters)
         return self.hybrid_search(clean_query, limit, filters)
 
+    def _warn_if_import_active(self) -> None:
+        """Log a one-shot warning when a search runs during an active import.
+
+        Import workers compete for the shared embedding model, so searches
+        may be slower than usual while files are being vectorised.
+        """
+        if not hasattr(self, "_import_warned"):
+            try:
+                from sensor_vector_db.models.database import ImportJob as _ImportJob
+                from sqlalchemy import select as _select
+
+                with session_scope(self.settings) as session:
+                    active = session.execute(
+                        _select(_ImportJob.id).where(
+                            _ImportJob.status.in_(("running", "stopping"))
+                        )
+                    ).first()
+                if active:
+                    logger.info(
+                        "检索请求在导入进行中发起——模型正忙，响应可能变慢"
+                    )
+            except Exception:
+                pass
+            self._import_warned = True  # type: ignore[attr-defined]
+
     def semantic_search(
         self,
         query: str,
         top_k: int,
         filters: dict[str, Any] | None = None,
     ) -> list[SearchResult]:
-        """Run vector similarity search."""
+        """Run vector similarity search.
+
+        Vectors from documents that are still being imported
+        (status != 'imported') are excluded so that partial or
+        uncommitted chunks never leak into search results.
+        """
         embedding = self.embedding.embed_query(query)
         vector_filters = _metadata_filters(filters)
-        return self.vector_store.query(embedding, top_k, vector_filters)
+        # Fetch extra results so the post-filter still yields top_k.
+        results = self.vector_store.query(embedding, top_k * 3, vector_filters)
+        return _filter_imported_only(self.settings, results)[:top_k]
 
     def keyword_search(
         self,
@@ -241,3 +274,48 @@ def _metadata_filters(filters: dict[str, Any] | None) -> dict[str, Any]:
         for key, value in filters.items()
         if key in {"file_type", "manufacturer", "sensor_model"} and value
     }
+
+
+def _filter_imported_only(
+    settings: Settings,
+    results: list[SearchResult],
+) -> list[SearchResult]:
+    """Keep only search results whose document has status='imported'.
+
+    During import, vectors are written to ChromaDB *before* the document
+    status is flipped from 'indexing' to 'imported'.  This post-filter
+    ensures that chunks from partially-committed documents never appear
+    in search results.
+
+    If *every* result document is imported, the list is returned unchanged
+    with zero overhead (no SQLite query).
+    """
+    if not results:
+        return results
+
+    # Quick-path: all document IDs that appear in the result set.
+    candidate_ids = {r.document_id for r in results}
+
+    with session_scope(settings) as session:
+        imported = {
+            row[0]
+            for row in session.execute(
+                select(Document.id).where(
+                    Document.id.in_(candidate_ids),
+                    Document.status == "imported",
+                )
+            ).all()
+        }
+
+    # If all candidates are imported, return immediately.
+    if imported == candidate_ids:
+        return results
+
+    filtered = [r for r in results if r.document_id in imported]
+    if len(filtered) < len(results):
+        logger.debug(
+            "语义搜索结果已过滤：%d/%d 条来自未完成导入的文档",
+            len(results) - len(filtered),
+            len(results),
+        )
+    return filtered

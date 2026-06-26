@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 from sensor_vector_db.config.settings import get_settings
 from sensor_vector_db.core.import_jobs import request_stop_all_running_jobs
@@ -49,19 +52,75 @@ def build_streamlit_command(
     return command
 
 
+_ctrlc_pressed = False
+
+
+def _signal_handler(signum: int, frame: object) -> None:
+    """Ensure double Ctrl‑C always force‑exits the process."""
+    global _ctrlc_pressed  # noqa: PLW0603
+    if _ctrlc_pressed:
+        # Second Ctrl‑C — bypass all cleanup, force exit immediately
+        sys.stderr.write("\n强制退出（第二次 Ctrl+C）\n")
+        os._exit(1)
+    _ctrlc_pressed = True
+    raise KeyboardInterrupt
+
+
 def run_streamlit(command: list[str], settings=None) -> int:
     """Run Streamlit and return its process exit code."""
-    process = subprocess.Popen(command)
+    original_handler = signal.signal(signal.SIGINT, _signal_handler)
+    creationflags = 0
+    if sys.platform.startswith("win"):
+        # CREATE_NEW_PROCESS_GROUP — Streamlit runs in its own group;
+        # Ctrl‑C is delivered to the launcher process only, which then
+        # forcefully tears down the child tree.
+        creationflags = 0x00000200  # CREATE_NEW_PROCESS_GROUP
+
+    process = subprocess.Popen(command, creationflags=creationflags)
+    exit_code = 130
     try:
-        return int(process.wait())
+        exit_code = int(process.wait())
+        # Normal exit (user closed the browser tab or clicked Stop in IDE).
+        # Still notify import workers so they can persist a clean stop state.
+        try:
+            request_stop_all_running_jobs(settings)
+        except Exception:
+            pass
+        return exit_code
     except KeyboardInterrupt:
+        print("\n正在停止… 按 Ctrl+C 再次强制退出", flush=True)
+    finally:
+        signal.signal(signal.SIGINT, original_handler)
+
+    # --- Ctrl+C path ---
+    try:
         request_stop_all_running_jobs(settings)
-        _terminate_process_tree(process)
-        return 130
+    except Exception:
+        pass
+    _terminate_process_tree(process)
+    # Give the process tree up to 3 s to tear down, then force-exit
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        if process.poll() is not None:
+            break
+        time.sleep(0.2)
+    else:
+        # Process still alive — kill unconditionally
+        try:
+            process.kill()
+            process.wait(timeout=1)
+        except Exception:
+            pass
+    os._exit(130)
 
 
 def _terminate_process_tree(process: subprocess.Popen) -> None:
-    """Terminate the Streamlit child process and its descendants."""
+    """Try to stop the Streamlit process and its children.
+
+    Runs *after* stop events have been signalled; on Windows we prefer the
+    stronger ``taskkill /T /F`` to also clean up orphaned grand-children
+    (e.g. worker threads spawned by ChromaDB / PyTorch).
+    """
     if process.poll() is not None:
         return
     if sys.platform.startswith("win"):
@@ -74,9 +133,13 @@ def _terminate_process_tree(process: subprocess.Popen) -> None:
         return
     process.terminate()
     try:
-        process.wait(timeout=5)
+        process.wait(timeout=3)
     except subprocess.TimeoutExpired:
         process.kill()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[str]]:

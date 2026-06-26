@@ -180,6 +180,10 @@ def test_incomplete_indexing_document_resumes_missing_vectors(
     embedding = CountingEmbedding(dimension=64)
     vector_store = VectorStore(test_settings)
 
+    # Create DocumentManager *before* the test document so that
+    # cleanup_orphan_indexing_documents() does not delete it.
+    manager = DocumentManager(test_settings, embedding=embedding, vector_store=vector_store)
+
     with session_scope(test_settings) as session:
         document = Document(
             file_path=str(source.resolve()),
@@ -236,8 +240,6 @@ def test_incomplete_indexing_document_resumes_missing_vectors(
     )
     embedding.calls = 0
     embedding.text_count = 0
-
-    manager = DocumentManager(test_settings, embedding=embedding, vector_store=vector_store)
 
     def fail_parse(*args, **kwargs):
         raise AssertionError("checkpoint resume should not reparse the file")

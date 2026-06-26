@@ -3,6 +3,7 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 import uuid
 
 from sqlalchemy import (
@@ -249,11 +250,85 @@ def get_engine(settings: Settings | None = None):
     return engine
 
 
+def _recover_wal_corruption(db_path: Path) -> None:
+    """Delete stale WAL/SHM sidecar files left by a force-killed process.
+
+    These files hold un-checkpointed transactions. Deleting them is safe
+    because the owning process is already dead — any uncommitted work is
+    lost, but the main database file stays consistent.
+
+    After deletion, opening the database will auto-create fresh sidecars.
+    """
+    from sensor_vector_db.utils.logger import get_logger as _get_log
+
+    wal = Path(str(db_path) + "-wal")
+    shm = Path(str(db_path) + "-shm")
+    removed = []
+    for sidecar in (wal, shm):
+        try:
+            if sidecar.exists():
+                sidecar.unlink()
+                removed.append(sidecar.name)
+        except OSError:
+            pass
+    if removed:
+        _get_log(__name__).warning(
+            "WAL 侧文件已损坏（可能由上次强制退出导致），已自动清理：%s，"
+            "主数据库文件完好，未提交的更改已丢失。",
+            ", ".join(removed),
+        )
+
+
+def _check_database_integrity(engine, db_path: Path) -> dict:
+    """Run PRAGMA integrity_check and return a status dict."""
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("PRAGMA integrity_check")).scalar()
+            ok = str(result).lower() == "ok"
+            return {"ok": ok, "message": str(result)}
+    except Exception as exc:
+        return {"ok": False, "message": str(exc)}
+
+
 def init_database(settings: Settings | None = None) -> None:
-    """Create all database tables if they do not exist."""
+    """Create all database tables if they do not exist.
+
+    Automatically recovers from WAL-sidecar corruption caused by force-kill
+    (Ctrl+C) during an active write — deletes the stale -wal/-shm files and
+    retries once.  Also runs a lightweight integrity check on startup to
+    detect deeper corruption early.
+    """
+    from sensor_vector_db.utils.logger import get_logger as _get_log
+
+    runtime_settings = settings or get_settings()
+    db_path = runtime_settings.sqlite_path
     engine = get_engine(settings)
-    Base.metadata.create_all(engine)
+
+    try:
+        Base.metadata.create_all(engine)
+    except Exception:
+        # WAL corruption after force-kill → clean up and retry once
+        _recover_wal_corruption(db_path)
+        cache_key = str(db_path.resolve())
+        _ENGINE_CACHE.pop(cache_key, None)
+        _SESSION_FACTORY_CACHE.pop(cache_key, None)
+        engine = get_engine(settings)
+        _get_log(__name__).info("WAL 恢复后重试数据库初始化…")
+        Base.metadata.create_all(engine)
+
     _ensure_sqlite_columns(engine)
+
+    # Startup integrity check — only runs if the main DB file exists
+    if db_path.exists():
+        status = _check_database_integrity(engine, db_path)
+        if status["ok"]:
+            _get_log(__name__).info("数据库完整性检查通过")
+        else:
+            _get_log(__name__).error(
+                "数据库完整性检查失败: %s — 建议手动运行 sqlite3 %s \"PRAGMA integrity_check\" 确认",
+                status["message"],
+                db_path,
+            )
 
 
 def get_session_factory(settings: Settings | None = None) -> sessionmaker[Session]:

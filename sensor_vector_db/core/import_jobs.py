@@ -10,7 +10,7 @@ from pathlib import Path
 import threading
 from typing import Any
 
-from sqlalchemy import desc, func, select, update
+from sqlalchemy import case, desc, func, select, update
 
 from sensor_vector_db.config.settings import Settings, get_settings
 from sensor_vector_db.core.document_manager import DocumentManager
@@ -178,6 +178,8 @@ class ImportJobManager:
                 if thread.is_alive()
             }
 
+        recovered_jobs = 0
+        recovered_files = 0
         with session_scope(self.settings) as session:
             jobs = session.execute(
                 select(ImportJob).where(ImportJob.status.in_(RUNNING_OR_STOPPING_STATUSES))
@@ -185,6 +187,7 @@ class ImportJobManager:
             for job in jobs:
                 if job.id in active_job_ids:
                     continue
+                recovered_jobs += 1
                 now = utc_now()
                 job.status = "interrupted"
                 job.phase = "上次运行已中断"
@@ -192,12 +195,14 @@ class ImportJobManager:
                 job.finished_at = now
                 job.updated_at = now
 
-                for row in session.execute(
+                processing_rows = session.execute(
                     select(ImportJobFile).where(
                         ImportJobFile.job_id == job.id,
                         ImportJobFile.status == "processing",
                     )
-                ).scalars():
+                ).scalars().all()
+                for row in processing_rows:
+                    recovered_files += 1
                     row.status = "pending"
                     row.phase = "恢复排队"
                     row.message = "上次运行退出时正在处理该文件，已放回待处理队列"
@@ -213,6 +218,13 @@ class ImportJobManager:
                         file_path=job.current_file,
                     )
                 )
+
+        if recovered_jobs:
+            logger.info(
+                "孤儿导入任务恢复：%d 个任务中断，%d 个文件重新排队（可手动恢复）",
+                recovered_jobs,
+                recovered_files,
+            )
 
     def list_jobs(self, limit: int = 20) -> list[ImportJobSnapshot]:
         """Return recent import jobs."""
@@ -281,6 +293,26 @@ class ImportJobManager:
                 for row in rows
             ]
 
+    def get_failed_rows(self, job_id: str) -> list[dict[str, Any]]:
+        """Return ALL failed file rows for the job — no limit applied."""
+        with session_scope(self.settings) as session:
+            rows = session.execute(
+                select(ImportJobFile)
+                .where(
+                    ImportJobFile.job_id == job_id,
+                    ImportJobFile.status == "failed",
+                )
+                .order_by(ImportJobFile.file_path)
+            ).scalars().all()
+            return [
+                {
+                    "file_path": row.file_path,
+                    "error": row.error_message,
+                    "message": row.message,
+                }
+                for row in rows
+            ]
+
     def _run_import(self, job_id: str, stop_event: threading.Event) -> None:
         """Background thread target."""
         try:
@@ -303,21 +335,24 @@ class ImportJobManager:
 
             self._finish_from_file_rows(job_id)
         except ImportCancelled:
+            counts = self._update_counts(job_id)
             self._mark_finished(
                 job_id,
                 status="interrupted",
                 phase="已停止",
                 message="收到停止请求，导入任务已在安全检查点中断，可稍后恢复。",
-                report={"error": "cancelled"},
+                report=counts,
             )
         except Exception as exc:
             logger.exception("Import job failed: %s", job_id)
+            counts = self._update_counts(job_id)
+            counts["error"] = str(exc)
             self._mark_finished(
                 job_id,
                 status="failed",
                 phase="任务失败",
                 message=classify_error(exc, "任务"),
-                report={"error": str(exc)},
+                report=counts,
             )
         finally:
             with _THREAD_LOCK:
@@ -329,26 +364,40 @@ class ImportJobManager:
         """Scan source path, plan retries/skips, and remove deleted documents."""
         self._update_job(job_id, "扫描目录", "正在扫描目录并生成导入计划", source_path)
         files = iter_supported_files(source_path)
-        current_paths = {str(path.resolve()) for path in files}
-        deleted_count = self._reconcile_deleted_documents(job_id, source_path, current_paths, manager)
 
         with session_scope(self.settings) as session:
             job = session.get(ImportJob, job_id)
             if job:
-                job.deleted = deleted_count
+                # Reset counters so the UI shows zero until scanning determines the real values.
                 job.total_files = len(files)
                 job.current_index = 0
+                job.imported = 0
+                job.updated = 0
+                job.skipped = 0
+                job.failed = 0
                 job.updated_at = utc_now()
-            for row in session.execute(
-                select(ImportJobFile).where(
-                    ImportJobFile.job_id == job_id,
-                    ImportJobFile.status == "processing",
+            # Reset ALL file rows to pending so this run's counts start from zero.
+            # _upsert_file_plan will re-evaluate every file and assign the correct status.
+            session.execute(
+                update(ImportJobFile)
+                .where(ImportJobFile.job_id == job_id)
+                .values(
+                    status="pending",
+                    phase="待重新评估",
+                    error_message=None,
+                    updated_at=utc_now(),
                 )
-            ).scalars():
-                row.status = "pending"
-                row.phase = "恢复排队"
-                row.message = "上次任务中断，已重新加入待处理队列"
-                row.updated_at = utc_now()
+            )
+            # Remove rows for files that are no longer in the supported file list.
+            # These are excluded file types (CSV, large TXT, db files, etc.) that
+            # should never appear as failures — they are simply not our concern.
+            supported_paths = {str(p.resolve()) for p in files}
+            session.execute(
+                ImportJobFile.__table__.delete().where(
+                    ImportJobFile.job_id == job_id,
+                    ImportJobFile.file_path.not_in(supported_paths),
+                )
+            )
 
         for index, file_path in enumerate(files, start=1):
             self._update_job(
@@ -360,6 +409,14 @@ class ImportJobManager:
                 total_files=len(files),
             )
             self._upsert_file_plan(job_id, file_path)
+
+        # Reconcile runs AFTER all files are hashed so we can tell moves from deletions.
+        deleted_count = self._reconcile_deleted_documents_post_plan(job_id, source_path, manager)
+        with session_scope(self.settings) as session:
+            job = session.get(ImportJob, job_id)
+            if job:
+                job.deleted = deleted_count
+                job.updated_at = utc_now()
 
         self._update_counts(job_id)
         self._add_event(
@@ -528,31 +585,80 @@ class ImportJobManager:
             row.finished_at = utc_now()
         self._add_event(job_id, "扫描失败", error, file_path, level="error")
 
-    def _reconcile_deleted_documents(
+    def _reconcile_deleted_documents_post_plan(
         self,
         job_id: str,
         source_path: str,
-        current_paths: set[str],
         manager: DocumentManager,
     ) -> int:
-        """Delete indexed documents whose source files no longer exist under the directory."""
+        """区分"文件移动"与"文件真正删除"，在 _upsert_file_plan 全部完成后调用。
+
+        此时 ImportJobFile 表已包含本次扫描到的所有文件的 file_hash。
+        通过哈希匹配判断：
+          - 旧路径消失但哈希在新路径存在 → 文件移动，原地更新路径，向量保留不变
+          - 哈希在当前目录中完全找不到 → 文件真正删除，清理向量
+        无论哪种情况均不产生 failed 记录。
+        """
         source = Path(source_path)
         if source.is_file():
             return 0
         root = str(source.resolve())
         deleted = 0
+
         with session_scope(self.settings) as session:
+            # 当前任务所有成功计划的文件：hash → 新路径（有 hash 才有意义）
+            job_file_rows = session.execute(
+                select(ImportJobFile.file_hash, ImportJobFile.file_path).where(
+                    ImportJobFile.job_id == job_id,
+                    ImportJobFile.file_hash.is_not(None),
+                )
+            ).all()
+            current_hash_to_path: dict[str, str] = {
+                row.file_hash: row.file_path for row in job_file_rows
+            }
+            current_planned_paths = {row.file_path for row in job_file_rows}
+
+            # 找出路径已不在当前磁盘扫描结果中的旧文档
             documents = session.execute(select(Document)).scalars().all()
             stale = [
-                document
-                for document in documents
-                if _is_under_root(document.file_path, root)
-                and document.file_path not in current_paths
+                doc for doc in documents
+                if _is_under_root(doc.file_path, root)
+                and doc.file_path not in current_planned_paths
             ]
-            stale_ids = [(document.id, document.file_path, document.filename) for document in stale]
 
-        for document_id, file_path, filename in stale_ids:
-            manager.delete_document(document_id)
+            # Pre-build a set of file_paths already occupied by non-stale documents,
+            # so we never try to move a stale doc onto a path that is already taken.
+            stale_ids = {doc.id for doc in stale}
+            occupied_paths: set[str] = {
+                d.file_path for d in documents if d.id not in stale_ids
+            }
+
+            truly_gone_ids: list[tuple[str, str, str]] = []
+            claimed_new_paths: set[str] = set()  # paths claimed by a previous stale doc this loop
+            for doc in stale:
+                new_path = current_hash_to_path.get(doc.file_hash) if doc.file_hash else None
+                if (
+                    new_path
+                    and new_path not in occupied_paths
+                    and new_path not in claimed_new_paths
+                ):
+                    # 文件已移动：原地更新路径，向量和 document_id 均保留
+                    claimed_new_paths.add(new_path)
+                    old_path = doc.file_path
+                    doc.file_path = new_path
+                    doc.filename = Path(new_path).name
+                    self._add_event(
+                        job_id,
+                        "路径更新",
+                        f"文件已移动，更新路径：{Path(old_path).name} → {Path(new_path).name}",
+                        new_path,
+                    )
+                else:
+                    truly_gone_ids.append((doc.id, doc.file_path, doc.filename))
+            # session commit → 路径更新持久化到 SQLite
+
+        for doc_id, file_path, filename in truly_gone_ids:
+            manager.delete_document(doc_id)
             deleted += 1
             self._add_event(
                 job_id,
@@ -563,13 +669,17 @@ class ImportJobManager:
         return deleted
 
     def _get_retryable_files(self, job_id: str) -> list[str]:
-        """Return file row IDs that need import or retry."""
+        """Return file row IDs that need import or retry, with previously-failed files first."""
         with session_scope(self.settings) as session:
             rows = session.execute(
                 select(ImportJobFile).where(
                     ImportJobFile.job_id == job_id,
                     ImportJobFile.status.in_(RETRYABLE_FILE_STATUSES),
-                ).order_by(ImportJobFile.file_path)
+                ).order_by(
+                    # Previously-failed files (phase = "重新尝试") are prioritized first.
+                    case((ImportJobFile.phase == "重新尝试", 0), else_=1),
+                    ImportJobFile.file_path,
+                )
             ).scalars().all()
             return [row.id for row in rows]
 
@@ -594,6 +704,14 @@ class ImportJobManager:
                     started_at=job.started_at or now,
                     finished_at=None,
                     updated_at=now,
+                    total_files=0,
+                    current_index=0,
+                    imported=0,
+                    updated=0,
+                    skipped=0,
+                    failed=0,
+                    deleted=0,
+                    current_file=None,
                 )
             )
             session.add(
@@ -720,6 +838,7 @@ class ImportJobManager:
             f"删除 {counts['deleted']}，失败 {counts['failed']}"
         )
         self._mark_finished(job_id, status, phase, message, counts)
+        self._write_session_log(job_id, counts)
 
     def _update_counts(self, job_id: str) -> dict[str, int]:
         """Recompute job counters from file rows."""
@@ -737,13 +856,13 @@ class ImportJobManager:
                 "deleted": job.deleted if job else 0,
             }
             if job:
-                job.total_files = counts["scanned"]
                 job.imported = counts["imported"]
                 job.updated = counts["updated"]
                 job.skipped = counts["skipped"]
                 job.failed = counts["failed"]
                 completed = counts["imported"] + counts["updated"] + counts["skipped"] + counts["failed"]
-                job.current_index = min(completed, counts["scanned"])
+                # current_index tracks progress against the scanned directory total, not row count.
+                job.current_index = min(completed, job.total_files) if job.total_files else completed
                 job.updated_at = utc_now()
             return counts
 
@@ -797,14 +916,13 @@ class ImportJobManager:
             job.finished_at = utc_now()
             job.updated_at = utc_now()
             job.report_json = json.dumps(report, ensure_ascii=False, default=str)
-            job.imported = int(report.get("imported", job.imported or 0))
-            job.updated = int(report.get("updated", job.updated or 0))
-            job.skipped = int(report.get("skipped", job.skipped or 0))
-            job.deleted = int(report.get("deleted", job.deleted or 0))
-            job.failed = int(report.get("failed", job.failed or 0))
-            if report.get("scanned") is not None:
-                job.total_files = int(report.get("scanned", job.total_files or 0))
-                job.current_index = int(report.get("scanned", job.current_index or 0))
+            # Use 0 as fallback — never preserve a stale value from a previous run.
+            job.imported = int(report.get("imported", 0))
+            job.updated = int(report.get("updated", 0))
+            job.skipped = int(report.get("skipped", 0))
+            job.deleted = int(report.get("deleted", 0))
+            job.failed = int(report.get("failed", 0))
+            # total_files is owned by the directory scan in _prepare_plan; do not overwrite here.
             session.add(
                 ImportJobEvent(
                     job_id=job_id,
@@ -814,6 +932,53 @@ class ImportJobManager:
                     file_path=job.current_file,
                 )
             )
+
+    def _write_session_log(self, job_id: str, counts: dict[str, int]) -> None:
+        """Append a one-line summary for this completed job to logs/import_sessions.log."""
+        try:
+            with session_scope(self.settings) as session:
+                job = session.get(ImportJob, job_id)
+                if not job:
+                    return
+                source = job.source_path
+                started = job.started_at.strftime("%Y-%m-%d %H:%M:%S") if job.started_at else "-"
+                finished = job.finished_at.strftime("%Y-%m-%d %H:%M:%S") if job.finished_at else "-"
+                status = job.status
+
+                failed_rows = session.execute(
+                    select(ImportJobFile).where(
+                        ImportJobFile.job_id == job_id,
+                        ImportJobFile.status == "failed",
+                    ).order_by(ImportJobFile.file_path)
+                ).scalars().all()
+                failed_details = [
+                    f"    [{Path(row.file_path).name}] {row.file_path}\n      原因: {row.error_message or row.message or '未知'}"
+                    for row in failed_rows
+                ]
+
+            log_path = Path(self.settings.log_file).parent / "import_sessions.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            lines = [
+                f"\n{'='*72}",
+                f"任务ID   : {job_id}",
+                f"目录     : {source}",
+                f"开始时间 : {started}",
+                f"结束时间 : {finished}",
+                f"状态     : {status}",
+                f"新增     : {counts.get('imported', 0)}",
+                f"更新     : {counts.get('updated', 0)}",
+                f"跳过     : {counts.get('skipped', 0)}",
+                f"删除     : {counts.get('deleted', 0)}",
+                f"失败     : {counts.get('failed', 0)}",
+            ]
+            if failed_details:
+                lines.append("失败文件 :")
+                lines.extend(failed_details)
+            lines.append(f"{'='*72}")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception as exc:
+            logger.warning("Failed to write session log: %s", exc)
 
     def _add_event(
         self,
@@ -978,11 +1143,10 @@ def request_stop_all_running_jobs(settings: Settings | None = None) -> None:
 
 
 def _request_stop_all_at_exit() -> None:
-    """Stop local worker threads at interpreter exit without touching unrelated jobs."""
+    """Stop local worker threads at interpreter exit — signal-only, no DB writes."""
     with _THREAD_LOCK:
-        has_local_workers = bool(_STOP_EVENTS)
-    if has_local_workers:
-        request_stop_all_running_jobs()
+        for stop_event in _STOP_EVENTS.values():
+            stop_event.set()
 
 
 atexit.register(_request_stop_all_at_exit)

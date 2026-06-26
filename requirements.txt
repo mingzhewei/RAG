@@ -7,6 +7,7 @@ chromadb==1.5.9
 streamlit==1.58.0
 pdfplumber==0.11.9
 pypdfium2==5.7.1
+pymupdf==1.26.1
 python-docx==1.2.0
 rank-bm25==0.2.2
 jieba==0.42.1

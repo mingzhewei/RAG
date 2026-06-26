@@ -6,13 +6,14 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
-from sqlalchemy import select
+from sqlalchemy import func as sa_func, select
 
 from sensor_vector_db.config.settings import Settings, get_settings
 from sensor_vector_db.core.document_processor import (
     DocumentChunker,
     DocumentParserFactory,
     MetadataExtractor,
+    PDFParser,
     metadata_to_json,
 )
 from sensor_vector_db.core.embedding import BaseEmbedding, create_embedding_provider
@@ -49,6 +50,57 @@ class DocumentManager:
         self.metadata_extractor = MetadataExtractor()
         self.embedding = embedding or create_embedding_provider(self.settings)
         self.vector_store = vector_store or VectorStore(self.settings)
+        # Clean up orphan indexing documents left by force-kill
+        self.cleanup_orphan_indexing_documents()
+
+    def cleanup_orphan_indexing_documents(self) -> int:
+        """Delete documents stuck in 'indexing' status after a force-kill.
+
+        These documents have SQLite chunk rows but their ChromaDB vectors
+        are incomplete or missing.  They will be re-imported on the next
+        import job run.
+
+        Returns the number of documents cleaned up.
+        """
+        from sensor_vector_db.utils.logger import get_logger as _get_log
+
+        with session_scope(self.settings) as session:
+            orphans = session.execute(
+                select(Document).where(Document.status == "indexing")
+            ).scalars().all()
+
+        if not orphans:
+            return 0
+
+        _get_log(__name__).warning(
+            "发现 %d 个未完成的索引文档（上次可能被强制退出）",
+            len(orphans),
+        )
+        cleaned = 0
+        for doc in orphans:
+            try:
+                self.vector_store.delete_by_document_id(doc.id)
+            except Exception as exc:
+                _get_log(__name__).warning(
+                    "清理孤儿文档向量失败 id=%s path=%s: %s",
+                    doc.id,
+                    doc.file_path,
+                    exc,
+                )
+            cleaned += 1
+
+        with session_scope(self.settings) as session:
+            for doc in session.execute(
+                select(Document).where(Document.status == "indexing")
+            ).scalars():
+                session.delete(doc)
+
+        if cleaned:
+            _get_log(__name__).info(
+                "已清理 %d 个孤儿索引文档，下次导入时将重新处理",
+                cleaned,
+            )
+        return cleaned
 
     def import_path(
         self,
@@ -230,6 +282,24 @@ class DocumentManager:
             "解析文档",
             "正在解析正文、表格或 OCR 文本",
         )
+
+        # For PDF files, use page-batched parsing so each page batch is written
+        # to a SQLite checkpoint immediately, keeping peak memory bounded.
+        if file_info.file_type == "pdf" and self.settings.pdf_page_batch_size > 0:
+            return self._import_pdf_batched(
+                file_path=file_path,
+                file_hash=file_hash,
+                file_info=file_info,
+                target_profile=target_profile,
+                existing_document_id=existing_document_id,
+                existing_snapshot=existing_snapshot,
+                status=status,
+                progress_callback=progress_callback,
+                cancel_callback=cancel_callback,
+                current_index=current_index,
+                total_files=total_files,
+            )
+
         segments = self.parser_factory.parse(file_path, cancel_callback=cancel_callback)
         self._check_cancelled(cancel_callback)
         self._emit_progress(
@@ -343,6 +413,192 @@ class DocumentManager:
             f"{file_path.name} 已从文件断点恢复完成",
         )
         return "updated"
+
+    def _import_pdf_batched(
+        self,
+        file_path: Path,
+        file_hash: str,
+        file_info: Any,
+        target_profile: str,
+        existing_document_id: str | None,
+        existing_snapshot: dict[str, Any] | None,
+        status: str,
+        progress_callback: ProgressCallback | None,
+        cancel_callback: Callable[[], None] | None,
+        current_index: int,
+        total_files: int,
+    ) -> str:
+        """Import a PDF by parsing page batches and writing incremental checkpoints.
+
+        Each batch of ``pdf_page_batch_size`` pages is parsed, chunked, and
+        persisted to SQLite immediately. Vectors are written after the full
+        parse so the embedding provider sees realistic batch sizes, but the
+        chunk rows are durable on disk from the moment a page batch finishes.
+        This means a very large PDF that is interrupted mid-parse can resume
+        from the existing chunk checkpoint rather than re-parsing from the start.
+        """
+        pdf_parser = PDFParser(self.settings)
+        all_segments: list = []
+        all_chunks: list = []
+        document_id: str | None = None
+
+        try:
+            batch_num = 0
+            for page_batch in pdf_parser.iter_page_batches(file_path, cancel_callback=cancel_callback):
+                self._check_cancelled(cancel_callback)
+                batch_num += 1
+                batch_chunks = self.chunker.chunk(page_batch)
+                if not batch_chunks:
+                    continue
+
+                # On the first batch create the document row and first chunk rows.
+                # On subsequent batches only append more chunk rows.
+                if document_id is None:
+                    metadata = self.metadata_extractor.extract(file_path, page_batch)
+                    self._emit_progress(
+                        progress_callback,
+                        current_index,
+                        total_files,
+                        str(file_path),
+                        "写入元数据",
+                        f"正在写入 SQLite checkpoint（第 {batch_num} 批分块）",
+                    )
+                    document_id, _chunk_ids, _docs, _metas = self._create_indexing_checkpoint(
+                        file_path=file_path,
+                        file_hash=file_hash,
+                        file_info=file_info,
+                        metadata=metadata,
+                        target_profile=target_profile,
+                        chunks=batch_chunks,
+                        existing_document_id=existing_document_id,
+                    )
+                    # After first batch existing_document_id is consumed; the
+                    # new document row owns the path from now on.
+                    existing_document_id = None
+                else:
+                    self._emit_progress(
+                        progress_callback,
+                        current_index,
+                        total_files,
+                        str(file_path),
+                        "写入元数据",
+                        f"追加 SQLite checkpoint（第 {batch_num} 批分块）",
+                    )
+                    self._append_chunks_to_document(document_id, batch_chunks)
+
+                all_segments.extend(page_batch)
+                all_chunks.extend(batch_chunks)
+
+            if not all_chunks:
+                raise RuntimeError("No indexable text was extracted from the file.")
+
+            if document_id is None:
+                # File produced no valid batches at all — fall back to a single
+                # empty checkpoint so downstream clean-up has a document_id.
+                metadata = self.metadata_extractor.extract(file_path, [])
+                document_id, _chunk_ids, _docs, _metas = self._create_indexing_checkpoint(
+                    file_path=file_path,
+                    file_hash=file_hash,
+                    file_info=file_info,
+                    metadata=metadata,
+                    target_profile=target_profile,
+                    chunks=[],
+                    existing_document_id=existing_document_id,
+                )
+                raise RuntimeError("No indexable text was extracted from the file.")
+
+            # Re-derive better metadata from first five segments of the full parse.
+            if len(all_segments) > 5:
+                full_metadata = self.metadata_extractor.extract(file_path, all_segments)
+                self._update_document_metadata(document_id, full_metadata)
+
+        except OperationCancelled:
+            raise
+        except Exception:
+            if document_id:
+                self.delete_document(document_id)
+                if existing_snapshot:
+                    try:
+                        self._restore_document_snapshot(existing_snapshot)
+                    except Exception:
+                        logger.exception(
+                            "Failed to restore previous document after batched PDF import failure"
+                        )
+            raise
+
+        # Reload all chunk IDs / content / metadatas from SQLite so the vector
+        # write loop works exactly like the non-batched path.
+        checkpoint = self._load_indexing_checkpoint(document_id, file_path)
+        if not checkpoint:
+            self.delete_document(document_id)
+            raise RuntimeError("Failed to reload PDF checkpoint for vectorization.")
+
+        try:
+            self._write_missing_vectors(
+                chunk_ids=checkpoint["chunk_ids"],
+                documents=checkpoint["documents"],
+                metadatas=checkpoint["metadatas"],
+                file_path=file_path,
+                progress_callback=progress_callback,
+                cancel_callback=cancel_callback,
+                current_index=current_index,
+                total_files=total_files,
+            )
+        except OperationCancelled:
+            raise
+        except Exception:
+            self.delete_document(document_id)
+            if existing_snapshot:
+                try:
+                    self._restore_document_snapshot(existing_snapshot)
+                except Exception:
+                    logger.exception(
+                        "Failed to restore previous document after PDF vector write failure"
+                    )
+            raise
+
+        self._delete_stale_vectors(str(file_path), set(checkpoint["chunk_ids"]), document_id)
+        self._mark_document_imported(document_id)
+        self._emit_progress(
+            progress_callback,
+            current_index,
+            total_files,
+            str(file_path),
+            "完成文件",
+            f"{file_path.name} 已{status}（分批解析，共 {len(all_chunks)} 个 chunk）",
+        )
+        return status
+
+    def _append_chunks_to_document(self, document_id: str, chunks: list) -> None:
+        """Append additional chunk rows to an existing indexing document."""
+        with session_scope(self.settings) as session:
+            document = session.get(Document, document_id)
+            if not document:
+                raise RuntimeError(
+                    f"Document {document_id} disappeared while appending PDF chunks."
+                )
+            # Determine the starting chunk index from existing rows.
+            max_index_row = session.execute(
+                select(sa_func.max(DocumentChunk.chunk_index)).where(
+                    DocumentChunk.document_id == document_id
+                )
+            ).scalar_one_or_none()
+            start_index = (max_index_row + 1) if max_index_row is not None else 0
+            for offset, chunk in enumerate(chunks):
+                chunk.chunk_index = start_index + offset
+            self._persist_chunks(session, document, chunks)
+
+    def _update_document_metadata(self, document_id: str, metadata: dict[str, Any]) -> None:
+        """Overwrite document-level metadata fields after a full parse."""
+        with session_scope(self.settings) as session:
+            document = session.get(Document, document_id)
+            if not document:
+                return
+            if metadata.get("manufacturer"):
+                document.manufacturer = metadata["manufacturer"]
+            if metadata.get("sensor_model"):
+                document.sensor_model = metadata["sensor_model"]
+            document.metadata_json = metadata_to_json(metadata)
 
     def _load_indexing_checkpoint(self, document_id: str, file_path: Path) -> dict[str, Any] | None:
         """Load persisted chunks for an interrupted indexing document."""
@@ -534,6 +790,11 @@ class DocumentManager:
                     select(Document.id).where(Document.status == "imported")
                 ).all()
             )
+            indexing_count = len(
+                session.execute(
+                    select(Document.id).where(Document.status == "indexing")
+                ).all()
+            )
             chunk_count = len(
                 session.execute(
                     select(DocumentChunk.id)
@@ -543,6 +804,7 @@ class DocumentManager:
             )
         return {
             "documents": document_count,
+            "indexing": indexing_count,
             "chunks": chunk_count,
             "vectors": self.vector_store.count(),
         }
