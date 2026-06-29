@@ -126,8 +126,8 @@ class PDFParser(BaseDocumentParser):
     so the caller can write incremental checkpoints without holding the
     entire document in memory.
 
-    When pdfplumber cannot open a file (corrupt, unusual structure, etc.)
-    the parser optionally retries with pymupdf (fitz) when
+    When pdfplumber cannot open a file or returns no usable text, the parser
+    optionally retries with PDFium text extraction when
     ``pdf_pymupdf_fallback`` is True.
     """
 
@@ -181,11 +181,11 @@ class PDFParser(BaseDocumentParser):
         except Exception as open_exc:  # noqa: BLE001
             if self.settings.pdf_pymupdf_fallback:
                 logger.warning(
-                    "pdfplumber failed to open %s (%s); retrying with pymupdf.",
+                    "pdfplumber failed to open %s (%s); retrying with pdfium text extraction.",
                     file_path,
                     open_exc,
                 )
-                yield from self._iter_batches_pymupdf(file_path, batch_size, cancel_callback)
+                yield from self._iter_batches_pdfium_text(file_path, batch_size, cancel_callback)
                 return
             raise RuntimeError(f"Failed to parse PDF {file_path}: {open_exc}") from open_exc
 
@@ -240,6 +240,12 @@ class PDFParser(BaseDocumentParser):
 
                     if batch:
                         yield batch
+                    elif self.settings.pdf_pymupdf_fallback:
+                        logger.warning(
+                            "pdfplumber extracted no usable text from %s; retrying with pdfium text extraction.",
+                            file_path,
+                        )
+                        yield from self._iter_batches_pdfium_text(file_path, batch_size, cancel_callback)
                 finally:
                     self._close_pdfium_document(pdfium_document)
         except OperationCancelled:
@@ -247,29 +253,18 @@ class PDFParser(BaseDocumentParser):
         except Exception as exc:
             raise RuntimeError(f"Failed to parse PDF {file_path}: {exc}") from exc
 
-    def _iter_batches_pymupdf(
+    def _iter_batches_pdfium_text(
         self,
         file_path: Path,
         batch_size: int,
         cancel_callback: CancelCallback | None,
     ):
-        """Yield ParsedSegment batches using pymupdf as a fallback parser."""
+        """Yield ParsedSegment batches using PDFium text extraction as fallback."""
         try:
-            import fitz  # pymupdf
-        except ImportError as exc:
-            raise RuntimeError(
-                "pymupdf (fitz) is not installed. "
-                "Run `pip install pymupdf` to enable the PDF fallback parser."
-            ) from exc
-
-        # On Windows, fitz.open(str(path)) fails for non-ASCII paths.
-        # Read the file bytes and open from a memory stream instead.
-        try:
-            pdf_bytes = file_path.read_bytes()
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            doc = self._open_pdfium_document(file_path)
         except Exception as exc:
             raise RuntimeError(
-                f"Failed to parse PDF {file_path} with pymupdf: {exc}"
+                f"Failed to parse PDF {file_path} with pdfium text extraction: {exc}"
             ) from exc
 
         try:
@@ -277,7 +272,12 @@ class PDFParser(BaseDocumentParser):
             for page_number in range(1, len(doc) + 1):
                 _check_cancelled(cancel_callback)
                 page = doc[page_number - 1]
-                text = page.get_text("text") or ""
+                text_page = page.get_textpage()
+                text = ""
+                get_text_range = getattr(text_page, "get_text_range", None)
+                if callable(get_text_range):
+                    text = get_text_range() or ""
+                text = text.replace("\r\n", "\n")
                 if text.strip():
                     batch.append(
                         ParsedSegment(
@@ -297,10 +297,10 @@ class PDFParser(BaseDocumentParser):
             raise
         except Exception as exc:
             raise RuntimeError(
-                f"Failed to parse PDF {file_path} with pymupdf: {exc}"
+                f"Failed to parse PDF {file_path} with pdfium text extraction: {exc}"
             ) from exc
         finally:
-            doc.close()
+            self._close_pdfium_document(doc)
 
     def _should_ocr_page(self, text: str, ocr_pages_used: int = 0) -> bool:
         """Return whether a PDF page should be sent to OCR."""

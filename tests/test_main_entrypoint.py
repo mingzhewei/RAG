@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import importlib
+import pytest
 
 
 class DummySettings:
@@ -69,7 +70,7 @@ def test_run_streamlit_interrupt_stops_imports_and_child(monkeypatch) -> None:
             return None
 
     process = FakeProcess()
-    monkeypatch.setattr(launcher.subprocess, "Popen", lambda command: process)
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda command, **kwargs: process)
     monkeypatch.setattr(
         launcher,
         "request_stop_all_running_jobs",
@@ -80,6 +81,14 @@ def test_run_streamlit_interrupt_stops_imports_and_child(monkeypatch) -> None:
         "_terminate_process_tree",
         lambda child: calls.append(("terminate", child)),
     )
+    monkeypatch.setattr(
+        launcher.os,
+        "_exit",
+        lambda code: (_ for _ in ()).throw(SystemExit(code)),
+    )
 
-    assert launcher.run_streamlit(["streamlit"]) == 130
+    with pytest.raises(SystemExit) as exc_info:
+        launcher.run_streamlit(["streamlit"])
+
+    assert exc_info.value.code == 130
     assert calls == [("stop_imports", None), ("terminate", process)]

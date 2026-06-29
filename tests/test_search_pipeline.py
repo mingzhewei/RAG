@@ -115,6 +115,22 @@ class CountingEmbedding(DeterministicEmbedding):
         return super().embed_texts(texts)
 
 
+class RecordingCollection:
+    """Small fake Chroma collection that records batch sizes."""
+
+    def __init__(self) -> None:
+        self.upsert_sizes: list[int] = []
+        self.update_sizes: list[int] = []
+
+    def upsert(self, *, ids, documents, embeddings, metadatas) -> None:
+        assert len(ids) == len(documents) == len(embeddings) == len(metadatas)
+        self.upsert_sizes.append(len(ids))
+
+    def update(self, *, ids, metadatas) -> None:
+        assert len(ids) == len(metadatas)
+        self.update_sizes.append(len(ids))
+
+
 def test_failed_update_restores_previous_document(test_settings, tmp_path: Path) -> None:
     """A failed update should not remove the previously indexed evidence."""
     source = tmp_path / "lidar.txt"
@@ -142,6 +158,24 @@ def test_failed_update_restores_previous_document(test_settings, tmp_path: Path)
     assert any("LDR-100" in chunk.content for chunk in chunks)
     assert not any("LDR-200" in chunk.content for chunk in chunks)
     assert vector_store.count() == 1
+
+
+def test_vector_store_splits_large_chroma_batches(test_settings) -> None:
+    """Large Chroma mutations must be split to the client batch limit."""
+    vector_store = VectorStore(test_settings)
+    vector_store.collection = RecordingCollection()
+    vector_store.client.get_max_batch_size = lambda: 3
+
+    chunk_ids = [f"id-{index}" for index in range(8)]
+    documents = [f"doc-{index}" for index in range(8)]
+    embeddings = [[float(index)] * 4 for index in range(8)]
+    metadatas = [{"file_path": f"/tmp/{index}.txt", "chunk_index": index} for index in range(8)]
+
+    vector_store.add_chunks(chunk_ids, documents, embeddings, metadatas)
+    vector_store.update_metadata(chunk_ids, metadatas)
+
+    assert vector_store.collection.upsert_sizes == [3, 3, 2]
+    assert vector_store.collection.update_sizes == [3, 3, 2]
 
 
 def test_incomplete_indexing_document_is_recovered(test_settings, tmp_path: Path) -> None:

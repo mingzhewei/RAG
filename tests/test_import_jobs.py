@@ -255,7 +255,7 @@ def test_atexit_without_local_workers_does_not_persist_stop(monkeypatch) -> None
 
 
 def test_atexit_with_local_workers_uses_worker_settings(monkeypatch, test_settings) -> None:
-    """Interpreter exit should persist stop requests only for local workers."""
+    """Interpreter exit should only signal local worker events."""
     calls = []
     stop_event = threading.Event()
 
@@ -280,7 +280,7 @@ def test_atexit_with_local_workers_uses_worker_settings(monkeypatch, test_settin
             import_jobs_module._JOB_SETTINGS.update(old_settings)
 
     assert stop_event.is_set()
-    assert calls == [((test_settings, ["job-1"]), {})]
+    assert calls == []
 
 
 def test_manager_recovers_orphaned_running_job(test_settings, tmp_path: Path) -> None:

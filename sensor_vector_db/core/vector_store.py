@@ -41,12 +41,19 @@ class VectorStore:
         if not chunk_ids:
             return
         try:
-            self.collection.upsert(
-                ids=chunk_ids,
-                documents=documents,
-                embeddings=embeddings,
-                metadatas=[_clean_metadata(item) for item in metadatas],
-            )
+            cleaned_metadatas = [_clean_metadata(item) for item in metadatas]
+            for batch_ids, batch_documents, batch_embeddings, batch_metadatas in self._iter_aligned_batches(
+                chunk_ids,
+                documents,
+                embeddings,
+                cleaned_metadatas,
+            ):
+                self.collection.upsert(
+                    ids=batch_ids,
+                    documents=batch_documents,
+                    embeddings=batch_embeddings,
+                    metadatas=batch_metadatas,
+                )
         except Exception as exc:
             first_id = chunk_ids[0] if chunk_ids else "N/A"
             file_path = metadatas[0].get("file_path", "unknown") if metadatas else "unknown"
@@ -64,10 +71,15 @@ class VectorStore:
         if not chunk_ids:
             return
         try:
-            self.collection.update(
-                ids=chunk_ids,
-                metadatas=[_clean_metadata(item) for item in metadatas],
-            )
+            cleaned_metadatas = [_clean_metadata(item) for item in metadatas]
+            for batch_ids, batch_metadatas in self._iter_aligned_batches(
+                chunk_ids,
+                cleaned_metadatas,
+            ):
+                self.collection.update(
+                    ids=batch_ids,
+                    metadatas=batch_metadatas,
+                )
         except Exception as exc:
             first_id = chunk_ids[0] if chunk_ids else "N/A"
             raise RuntimeError(
@@ -181,6 +193,30 @@ class VectorStore:
             return int(self.collection.count())
         except Exception:
             return 0
+
+    def max_batch_size(self) -> int:
+        """Return the largest mutation batch accepted by the current Chroma client."""
+        get_max_batch_size = getattr(self.client, "get_max_batch_size", None)
+        if callable(get_max_batch_size):
+            try:
+                value = int(get_max_batch_size())
+                if value > 0:
+                    return value
+            except Exception:
+                logger.warning("Failed to read Chroma max batch size", exc_info=True)
+        return 512
+
+    def _iter_aligned_batches(self, *sequences: list[Any]):
+        """Yield aligned slices across one or more equally-sized sequences."""
+        if not sequences:
+            return
+        length = len(sequences[0])
+        if any(len(sequence) != length for sequence in sequences):
+            raise ValueError("All aligned sequences must have the same length.")
+        batch_size = self.max_batch_size()
+        for start in range(0, length, batch_size):
+            end = start + batch_size
+            yield tuple(sequence[start:end] for sequence in sequences)
 
     def _to_results(self, result: dict[str, Any]) -> list[SearchResult]:
         """Convert raw ChromaDB response into unified search results."""

@@ -143,3 +143,30 @@ def test_pdf_parser_propagates_cancellation(test_settings, tmp_path: Path) -> No
 
     with pytest.raises(OperationCancelled):
         PDFParser(test_settings).parse(pdf_path, cancel_callback=cancel)
+
+
+def test_pdf_parser_falls_back_to_pdfium_text_when_pdfplumber_returns_nothing(
+    test_settings, tmp_path: Path, monkeypatch
+) -> None:
+    """PDFium text extraction should rescue PDFs when pdfplumber yields no segments."""
+    reportlab = pytest.importorskip("reportlab.pdfgen.canvas")
+    pdf_path = tmp_path / "sensor.pdf"
+    canvas = reportlab.Canvas(str(pdf_path))
+    canvas.drawString(72, 720, "Model: AWR294x")
+    canvas.drawString(72, 700, "Range: 100 m")
+    canvas.save()
+
+    parser = PDFParser(test_settings)
+
+    def empty_extract_tables(self):
+        return []
+
+    def empty_extract_text(self):
+        return ""
+
+    monkeypatch.setattr("pdfplumber.page.Page.extract_text", empty_extract_text)
+    monkeypatch.setattr("pdfplumber.page.Page.extract_tables", empty_extract_tables)
+
+    segments = parser.parse(pdf_path)
+
+    assert any("AWR294x" in segment.content for segment in segments)
