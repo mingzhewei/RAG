@@ -39,11 +39,18 @@ class QASystem:
         question: str,
         top_k: int | None = None,
         filters: dict | None = None,
+        mode: str = "hybrid",
     ) -> dict:
-        """Answer a question from retrieved document chunks."""
+        """Answer a question from retrieved document chunks.
+
+        Args:
+            mode: Search mode to use for retrieval (``hybrid``,
+                ``semantic``, or ``keyword``).  The caller controls this
+                so the sources shown to the user match what the LLM saw.
+        """
         results = self.search_engine.search(
             question,
-            mode="hybrid",
+            mode=mode,
             top_k=top_k or self.settings.search_top_k,
             filters=filters,
         )
@@ -66,15 +73,21 @@ class QASystem:
         question: str,
         top_k: int | None = None,
         filters: dict | None = None,
+        mode: str = "hybrid",
     ) -> Generator[str, None, dict]:
         """Answer a question with streaming output.
 
         Yields text chunks as they arrive, and returns the final dict
         (answer + sources) via Generator return value.
+
+        Args:
+            mode: Search mode for retrieval — must match the mode the
+                UI uses to display sources, otherwise the [Sn] labels
+                in the answer won't correspond to the shown cards.
         """
         results = self.search_engine.search(
             question,
-            mode="hybrid",
+            mode=mode,
             top_k=top_k or self.settings.search_top_k,
             filters=filters,
         )

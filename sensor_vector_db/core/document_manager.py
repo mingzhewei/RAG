@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 from typing import Any, Callable
 
 from sqlalchemy import func as sa_func, select
@@ -33,6 +34,12 @@ from sensor_vector_db.utils.logger import get_logger
 logger = get_logger(__name__)
 ProgressCallback = Callable[..., None]
 
+# Module-level lock so that only one DocumentManager instance performs
+# startup recovery at a time.  Without this, concurrent __init__ calls
+# (UI thread + import worker thread) would both try to recover the same
+# orphan documents simultaneously.
+_RECOVERY_LOCK = threading.Lock()
+
 
 class DocumentManager:
     """Manage local document import and indexed metadata."""
@@ -50,57 +57,158 @@ class DocumentManager:
         self.metadata_extractor = MetadataExtractor()
         self.embedding = embedding or create_embedding_provider(self.settings)
         self.vector_store = vector_store or VectorStore(self.settings)
-        # Clean up orphan indexing documents left by force-kill
-        self.cleanup_orphan_indexing_documents()
+        # Recover (NOT blindly delete) indexing documents left by force-kill.
+        # Documents with valid chunk checkpoints are preserved so the next
+        # import job can resume them instead of re-parsing from scratch.
+        self.recover_indexing_documents()
 
-    def cleanup_orphan_indexing_documents(self) -> int:
-        """Delete documents stuck in 'indexing' status after a force-kill.
+    def recover_indexing_documents(self) -> dict:
+        """Recover documents stuck in ``status='indexing'`` after a force-kill.
 
-        These documents have SQLite chunk rows but their ChromaDB vectors
-        are incomplete or missing.  They will be re-imported on the next
-        import job run.
+        Recovery strategy (most to least ideal):
 
-        Returns the number of documents cleaned up.
+        1. **Chunk checkpoint valid → keep it.**
+           The document has chunk rows in SQLite; the next import job can
+           skip parsing and only redo the missing vectors via
+           ``_resume_indexing_document()``.
+
+        2. **Chunk checkpoint missing or empty → delete it.**
+           Without persisted chunks, there is nothing to resume.  The
+           document is removed from both SQLite and ChromaDB.  It will be
+           re-processed from the source file next time.
+
+        3. **ChromaDB vector cleanup.**
+           For kept documents, orphan Chroma vectors (written before
+           ``os._exit``) that belong to no current chunk row are deleted.
+
+        Returns:
+            Dict with keys ``kept``, ``deleted``, and ``vectors_cleaned``.
         """
         from sensor_vector_db.utils.logger import get_logger as _get_log
 
-        with session_scope(self.settings) as session:
-            orphans = session.execute(
-                select(Document).where(Document.status == "indexing")
-            ).scalars().all()
+        report = {"kept": 0, "deleted": 0, "vectors_cleaned": 0}
 
-        if not orphans:
+        # Acquire the module-level lock so concurrent DocumentManager
+        # instances (UI thread + import workers) don't race on recovery.
+        if not _RECOVERY_LOCK.acquire(blocking=False):
+            _get_log(__name__).debug("恢复逻辑正由其他实例执行，跳过")
+            return report
+
+        try:
+            # Batch-load orphans AND their chunk counts in two queries
+            # instead of one session per document.
+            with session_scope(self.settings) as session:
+                orphans = session.execute(
+                    select(Document).where(Document.status == "indexing")
+                ).scalars().all()
+                if not orphans:
+                    return report
+
+                orphan_ids = [d.id for d in orphans]
+                # Build a dict {document_id: chunk_count} in a single query
+                chunk_count_rows = session.execute(
+                    select(
+                        DocumentChunk.document_id,
+                        sa_func.count(),
+                    )
+                    .where(DocumentChunk.document_id.in_(orphan_ids))
+                    .group_by(DocumentChunk.document_id)
+                ).all()
+                chunk_counts = {row[0]: row[1] for row in chunk_count_rows}
+
+            _get_log(__name__).warning(
+                "发现 %d 个未完成的索引文档（上次可能被强制退出），正在分析恢复策略…",
+                len(orphans),
+            )
+
+            for doc in orphans:
+                doc_id = doc.id
+                chunk_count = chunk_counts.get(doc_id, 0)
+
+                if chunk_count and chunk_count > 0:
+                    # Strategy 1: checkpoint is valid — keep it for resume
+                    _get_log(__name__).info(
+                        "保留可恢复索引文档 id=%s path=%s chunks=%d（下次导入将从断点恢复）",
+                        doc_id,
+                        doc.file_path,
+                        chunk_count,
+                    )
+                    # Clean partial ChromaDB vectors for this document that have
+                    # no matching chunk row, keeping only valid checkpoints.
+                    try:
+                        cleaned = self._prune_orphan_chroma_vectors(doc_id)
+                        report["vectors_cleaned"] += cleaned
+                    except Exception as exc:
+                        _get_log(__name__).warning(
+                            "清理 Chroma 孤立向量失败 doc=%s: %s", doc_id, exc
+                        )
+                    report["kept"] += 1
+                else:
+                    # Strategy 2: no chunks — truly orphaned, safe to delete
+                    _get_log(__name__).info(
+                        "清理无效索引文档 id=%s path=%s（无可用分块断点，将重新处理）",
+                        doc_id,
+                        doc.file_path,
+                    )
+                    try:
+                        self.vector_store.delete_by_document_id(doc_id)
+                    except Exception as exc:
+                        _get_log(__name__).warning(
+                            "清理 Chroma 向量失败 doc=%s: %s", doc_id, exc
+                        )
+                    with session_scope(self.settings) as session:
+                        doomed = session.get(Document, doc_id)
+                        if doomed:
+                            session.delete(doomed)
+                    report["deleted"] += 1
+
+            if report["kept"] or report["deleted"]:
+                _get_log(__name__).info(
+                    "索引文档恢复完成：保留 %d 个（可断点续传），删除 %d 个（无断点），清理孤立向量 %d 个",
+                    report["kept"],
+                    report["deleted"],
+                    report["vectors_cleaned"],
+                )
+            return report
+        finally:
+            _RECOVERY_LOCK.release()
+
+    def _prune_orphan_chroma_vectors(self, document_id: str) -> int:
+        """Delete ChromaDB vectors for a document that lack a matching
+        SQLite chunk row, leaving only valid checkpoints intact.
+
+        Returns the number of vectors removed.
+        """
+        with session_scope(self.settings) as session:
+            valid_chunk_ids = {
+                row[0]
+                for row in session.execute(
+                    select(DocumentChunk.id).where(
+                        DocumentChunk.document_id == document_id
+                    )
+                ).all()
+            }
+
+        if not valid_chunk_ids:
             return 0
 
-        _get_log(__name__).warning(
-            "发现 %d 个未完成的索引文档（上次可能被强制退出）",
-            len(orphans),
-        )
-        cleaned = 0
-        for doc in orphans:
-            try:
-                self.vector_store.delete_by_document_id(doc.id)
-            except Exception as exc:
-                _get_log(__name__).warning(
-                    "清理孤儿文档向量失败 id=%s path=%s: %s",
-                    doc.id,
-                    doc.file_path,
-                    exc,
-                )
-            cleaned += 1
-
-        with session_scope(self.settings) as session:
-            for doc in session.execute(
-                select(Document).where(Document.status == "indexing")
-            ).scalars():
-                session.delete(doc)
-
-        if cleaned:
-            _get_log(__name__).info(
-                "已清理 %d 个孤儿索引文档，下次导入时将重新处理",
-                cleaned,
+        try:
+            result = self.vector_store.collection.get(
+                where={"document_id": document_id},
+                include=["metadatas"],
             )
-        return cleaned
+            chroma_ids = set(result.get("ids") or [])
+        except Exception:
+            return 0
+
+        orphan_ids = chroma_ids - valid_chunk_ids
+        if orphan_ids:
+            try:
+                self.vector_store.collection.delete(ids=list(orphan_ids))
+                return len(orphan_ids)
+            except Exception:
+                pass
+        return 0
 
     def import_path(
         self,

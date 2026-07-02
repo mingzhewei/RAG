@@ -81,6 +81,11 @@ class BGEEmbedding(BaseEmbedding):
         (offline mode).  If that fails because the model has not been
         downloaded yet, retries with network access enabled so the
         download can happen.
+
+        Environment variables ``HF_HUB_OFFLINE`` and
+        ``TRANSFORMERS_OFFLINE`` are temporarily set during the offline
+        attempt and **always restored** afterwards, so they never leak
+        into other parts of the process.
         """
         if self._model is not None:
             return self._model
@@ -88,33 +93,46 @@ class BGEEmbedding(BaseEmbedding):
         model_name = self.settings.embedding_model
         logger.info("Loading embedding model %s (offline-first)", model_name)
 
-        # Try offline first — the model is normally cached after a
-        # successful download and should not require network access.
-        for attempt in (1, 2):
-            offline = attempt == 1
-            if offline:
-                os.environ["HF_HUB_OFFLINE"] = "1"
-                os.environ["TRANSFORMERS_OFFLINE"] = "1"
-            else:
-                os.environ.pop("HF_HUB_OFFLINE", None)
-                os.environ.pop("TRANSFORMERS_OFFLINE", None)
-                logger.warning("离线加载失败，尝试从 HuggingFace 下载模型（需要网络）")
+        # Save original env state so we can restore it regardless of
+        # success or failure — never pollute the process environment.
+        original_hf = os.environ.get("HF_HUB_OFFLINE")
+        original_tf = os.environ.get("TRANSFORMERS_OFFLINE")
 
+        try:
+            # Attempt 1: offline (model is normally cached)
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
             try:
                 self._model = _create_bge_model(model_name, self.settings)
                 return self._model
             except Exception as exc:
-                if offline:
-                    logger.debug("离线模式加载失败: %s", exc)
-                else:
-                    raise RuntimeError(
-                        f"无法加载嵌入模型 {model_name}。\n"
-                        f"离线模式已尝试但模型缓存不完整。\n"
-                        f"在线下载也失败了，请检查网络连接。\n"
-                        f"原始错误: {exc}"
-                    ) from exc
+                logger.debug("离线模式加载失败: %s", exc)
 
-        raise RuntimeError(f"无法加载嵌入模型 {model_name}")
+            # Attempt 2: online (network download)
+            os.environ.pop("HF_HUB_OFFLINE", None)
+            os.environ.pop("TRANSFORMERS_OFFLINE", None)
+            logger.warning("离线加载失败，尝试从 HuggingFace 下载模型（需要网络）")
+            try:
+                self._model = _create_bge_model(model_name, self.settings)
+                return self._model
+            except Exception as exc:
+                raise RuntimeError(
+                    f"无法加载嵌入模型 {model_name}。\n"
+                    f"离线模式已尝试但模型缓存不完整。\n"
+                    f"在线下载也失败了，请检查网络连接。\n"
+                    f"原始错误: {exc}"
+                ) from exc
+        finally:
+            # Always restore the original environment — never leave
+            # HF_HUB_OFFLINE=1 polluting the process after we're done.
+            if original_hf is None:
+                os.environ.pop("HF_HUB_OFFLINE", None)
+            else:
+                os.environ["HF_HUB_OFFLINE"] = original_hf
+            if original_tf is None:
+                os.environ.pop("TRANSFORMERS_OFFLINE", None)
+            else:
+                os.environ["TRANSFORMERS_OFFLINE"] = original_tf
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Embed text strings with BGE-M3 dense vectors."""

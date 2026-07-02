@@ -179,6 +179,8 @@ with st.sidebar:
     st.markdown("### 功能导航")
     st.page_link("app.py", label="🏠 智能搜索", icon="🔎")
     st.page_link("pages/1_文档导入.py", label="📥 文档导入")
+    st.page_link("pages/2_智能检索.py", label="🔍 智能检索")
+    st.page_link("pages/3_智能问答.py", label="💬 智能问答")
     st.page_link("pages/4_参数抽取.py", label="📊 参数抽取")
     st.page_link("pages/5_参数对比.py", label="📋 参数对比")
     st.page_link("pages/6_系统管理.py", label="⚙️ 系统管理")
@@ -247,6 +249,11 @@ if not st.session_state.chat_history:
         if example_cols[idx].button(
             example, key=f"example_{idx}", use_container_width=True,
         ):
+            # Use a dedicated session key + counter so that clicking
+            # the same example twice always triggers a fresh search.
+            # The old code set search_input directly, which made
+            # do_search False on the second click.
+            st.session_state.pending_query = example
             st.session_state.search_input = example
             st.rerun()
 
@@ -308,34 +315,41 @@ def render_chat_message(role: str, content: str) -> None:
 
 
 # ── 处理搜索 ──
-do_search = search_clicked or (query and st.session_state.get("search_input") != st.session_state.get("last_search_input"))
+# Trigger search on: button click, pending_query (from example buttons),
+# or when the text input changed since last search.
+pending = st.session_state.pop("pending_query", None)
+input_changed = st.session_state.get("search_input") != st.session_state.get("last_search_input")
+do_search = search_clicked or bool(pending) or (query and input_changed)
 
-if do_search and query.strip():
-    st.session_state.last_search_input = query.strip()
-    st.session_state.last_query = query.strip()
+if do_search and (query.strip() or pending):
+    actual_query = (pending or query).strip()
+    st.session_state.last_search_input = actual_query
+    st.session_state.last_query = actual_query
+    # Keep the text input in sync if search was triggered by an example
+    st.session_state.search_input = actual_query
 
     # 获取高级设置
     top_k = st.session_state.get("rag_top_k", 8)
     mode = st.session_state.get("rag_mode", "hybrid")
 
     # 添加用户消息到历史
-    st.session_state.chat_history.append({"role": "user", "content": query.strip()})
+    st.session_state.chat_history.append({"role": "user", "content": actual_query})
 
-    # 执行 RAG 问答
+    # 执行 RAG 问答 — pass the user-selected mode so the LLM sees the
+    # exact same sources we display below.
     with st.spinner("正在检索并生成回答..."):
         try:
-            payload = get_qa_system().answer(query.strip(), top_k=top_k)
+            payload = get_qa_system().answer(actual_query, top_k=top_k, mode=mode)
         except Exception as e:
             payload = {
                 "answer": f"检索或回答过程中出现错误：{e}",
                 "sources": [],
             }
 
-    # 先做纯检索（用于展示检索结果）
-    search_results = get_search_engine().search(
-        query.strip(), mode=mode, top_k=top_k,
-    )
-    st.session_state.last_search_results = search_results
+    # Use the QA system's own sources for display — they are guaranteed
+    # to match the [Sn] labels in the answer.  The old code ran a second
+    # search with a potentially different mode, causing mismatched sources.
+    search_results = payload.get("sources", [])
 
     # 添加助手回答到历史
     st.session_state.chat_history.append({

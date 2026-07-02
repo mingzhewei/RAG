@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from sensor_vector_db.config.settings import Settings, get_settings
@@ -12,17 +13,51 @@ from sensor_vector_db.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _recover_chroma_wal(chroma_path: Path) -> None:
+    """Delete stale WAL/SHM sidecar files from ChromaDB's internal SQLite.
+
+    ChromaDB stores its collection data in ``chroma.sqlite3`` under the
+    persistent path.  After ``os._exit()`` kills a write, the WAL/SHM
+    sidecars can be left corrupted.  Deleting them is safe because the
+    owning process is dead — the main DB file stays consistent.
+    """
+    chroma_db = chroma_path / "chroma.sqlite3"
+    if not chroma_db.exists():
+        return
+    removed = []
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(chroma_db) + suffix)
+        try:
+            if sidecar.exists():
+                sidecar.unlink()
+                removed.append(sidecar.name)
+        except OSError:
+            pass
+    if removed:
+        logger.warning(
+            "ChromaDB WAL 侧文件已损坏（可能由上次强制退出导致），已自动清理：%s",
+            ", ".join(removed),
+        )
+
+
 class VectorStore:
     """Persistent local vector store built on ChromaDB."""
 
     def __init__(self, settings: Settings | None = None) -> None:
-        """Initialize Chroma client and collection."""
+        """Initialize Chroma client and collection.
+
+        Automatically recovers from ChromaDB WAL corruption caused by
+        ``os._exit()`` during a vector write.
+        """
         self.settings = settings or get_settings()
         self.settings.ensure_directories()
         try:
             import chromadb
         except ImportError as exc:
             raise RuntimeError("chromadb is required for vector storage.") from exc
+
+        # Recover ChromaDB's internal SQLite before opening the client.
+        _recover_chroma_wal(self.settings.chroma_path)
 
         self.client = chromadb.PersistentClient(path=str(self.settings.chroma_path))
         self.collection = self.client.get_or_create_collection(

@@ -123,6 +123,10 @@ def apply_runtime_llm_settings(
         elif provider == "deepseek":
             os.environ["DEEPSEEK_API_KEY"] = api_key.strip()
     get_settings.cache_clear()
+    # Clear all cached services so they pick up the new settings.
+    # Without this, QASystem/SearchEngine/etc. retain stale API keys
+    # and base URLs from the previous configuration.
+    clear_resource_caches()
 
 
 def apply_runtime_api_key(api_key: str) -> None:

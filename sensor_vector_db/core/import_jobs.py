@@ -1142,6 +1142,40 @@ def request_stop_all_running_jobs(settings: Settings | None = None) -> None:
             _persist_stop_request(job_settings_item, [job_id])
 
 
+def signal_stop_all_running_jobs_nonblocking(settings: Settings | None = None) -> None:
+    """Signal all import workers to stop without blocking on SQLite writes.
+
+    Sets the in-memory stop events immediately (microseconds), then
+    attempts DB persistence in a **daemon thread** so that a busy WAL
+    lock during Ctrl+C shutdown doesn't freeze the launcher process.
+
+    The in-memory events are what actually stop the workers — the DB
+    write is only for cross-process visibility and is redundant on
+    single-process shutdown.  On next startup,
+    ``_recover_orphaned_running_jobs`` handles any leftover state.
+    """
+    with _THREAD_LOCK:
+        for stop_event in _STOP_EVENTS.values():
+            stop_event.set()
+
+    def _persist_in_background() -> None:
+        try:
+            if settings is not None:
+                _persist_stop_request(settings)
+            else:
+                for job_id in list(_JOB_SETTINGS):
+                    job_settings_item = _JOB_SETTINGS.get(job_id)
+                    if job_settings_item is not None:
+                        _persist_stop_request(job_settings_item, [job_id])
+        except Exception:
+            pass  # best-effort; recovery handles it on next startup
+
+    import threading as _threading
+
+    bg = _threading.Thread(target=_persist_in_background, daemon=True)
+    bg.start()
+
+
 def _request_stop_all_at_exit() -> None:
     """Stop local worker threads at interpreter exit — signal-only, no DB writes."""
     with _THREAD_LOCK:

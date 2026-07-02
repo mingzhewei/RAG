@@ -62,18 +62,18 @@ def test_run_streamlit_interrupt_stops_imports_and_child(monkeypatch) -> None:
 
     class FakeProcess:
         pid = 12345
-
-        def wait(self):
-            raise KeyboardInterrupt
+        returncode = 1
 
         def poll(self):
-            return None
+            # After the shutdown sequence, return non-None so the
+            # process-wait loop exits immediately.
+            return 1 if calls else None
 
     process = FakeProcess()
     monkeypatch.setattr(launcher.subprocess, "Popen", lambda command, **kwargs: process)
     monkeypatch.setattr(
         launcher,
-        "request_stop_all_running_jobs",
+        "signal_stop_all_running_jobs_nonblocking",
         lambda settings=None: calls.append(("stop_imports", settings)),
     )
     monkeypatch.setattr(
@@ -81,11 +81,18 @@ def test_run_streamlit_interrupt_stops_imports_and_child(monkeypatch) -> None:
         "_terminate_process_tree",
         lambda child: calls.append(("terminate", child)),
     )
+    # Simulate empty worker dict — no import threads are running.
+    monkeypatch.setattr(launcher, "_import_workers", {})
     monkeypatch.setattr(
         launcher.os,
         "_exit",
         lambda code: (_ for _ in ()).throw(SystemExit(code)),
     )
+
+    # Simulate Ctrl+C — on Windows the signal handler runs in a different
+    # thread and merely flips this flag; the main thread's polling loop
+    # picks it up on the next iteration.
+    monkeypatch.setattr(launcher, "_ctrlc_pressed", True)
 
     with pytest.raises(SystemExit) as exc_info:
         launcher.run_streamlit(["streamlit"])
